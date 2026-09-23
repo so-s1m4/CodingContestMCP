@@ -13,6 +13,7 @@ from starlette.responses import FileResponse, JSONResponse
 from . import game_tools  # noqa: F401 -- registers game tools
 from .client import APIError, CCCClient
 from .context import account_service
+from .download_links import download_links
 from .service import Service
 from .sessions import AccountSessions
 from .tools import create_mcp, settings
@@ -28,6 +29,29 @@ class AccountMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        direct_download = re.fullmatch(
+            r"/mcp/direct-download/([A-Za-z0-9_-]{40,60})", scope["path"]
+        )
+        if direct_download:
+            if scope["method"] != "GET":
+                return await self.reject(
+                    scope, receive, send, 405, "Use GET for artifact downloads"
+                )
+            link = download_links.consume(direct_download.group(1))
+            if link is None:
+                return await self.reject(
+                    scope, receive, send, 404, "Download link expired or already used"
+                )
+            path, filename = link
+            return await FileResponse(
+                path,
+                media_type="application/octet-stream",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+                filename=filename,
+            )(scope, receive, send)
         artifact_route = scope["path"].startswith("/mcp/artifacts/")
         if scope["path"].rstrip("/") != "/mcp" and not artifact_route:
             return await self.app(scope, receive, send)

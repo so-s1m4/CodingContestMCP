@@ -11,6 +11,7 @@ import httpx
 from mcp.types import ImageContent
 
 from .context import current_service
+from .download_links import download_links
 from .service import compact_progress, contest_slug, segment
 from .telegram_state import claim_solution, update_solution_status
 from .tools import _call, _params, local, result, tool
@@ -189,7 +190,8 @@ async def read_artifact(
     length: int = 65536,
     encoding: Literal["text", "base64"] = "text",
 ):
-    """Read a bounded byte range. Follow next_offset until null. Base64 preserves arbitrary bytes."""
+    """Read a bounded byte range. Follow next_offset until null. Base64 preserves arbitrary bytes.
+    For files over 256 KiB that the agent needs to process, use get_artifact_download_url instead."""
     return await _call(
         lambda: local(
             lambda: current_service().artifacts.read(
@@ -197,6 +199,28 @@ async def read_artifact(
             )
         )
     )
+
+
+@tool(read_only=True)
+async def get_artifact_download_url(artifact_id: str, filename: str):
+    """Create a one-time, five-minute direct download link for a file up to 30 MiB.
+    Use this for large inputs so the agent can save the file in its workspace instead of reading chunks."""
+
+    async def run():
+        service = current_service()
+        path = service.artifacts.path(artifact_id)
+        size = path.stat().st_size
+        if size > 30 * 1024 * 1024:
+            raise ValueError("Direct downloads are limited to 30 MiB")
+        safe_filename = filename.replace("\\", "_").replace("/", "_")
+        if not safe_filename or any(ord(char) < 32 for char in safe_filename):
+            raise ValueError("Invalid filename")
+        link = download_links.issue(
+            path, safe_filename, service.client.settings.public_origin
+        )
+        return {**link, "bytes": size}
+
+    return await _call(run)
 
 
 @tool(read_only=True)

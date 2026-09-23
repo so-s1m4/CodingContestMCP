@@ -19,3 +19,5 @@ Or with Python 3.12+: `pip install -r requirements.txt && python server.py`.
 ## Connect and use
 
 Connect to `http://localhost:8000/mcp` with `X-CCC-Session: <CCC SESSION cookie>` (omit `SESSION=`). Public deployments require HTTPS and `MCP_PUBLIC_ORIGIN`.
+
+Large task files can be downloaded directly into the MCP client's workspace: call `get_artifact_download_url` with the returned `artifact_id` and filename, then fetch the returned URL with the client's file or shell tools. Links are single-use, expire after five minutes, and support files up to 30 MiB. For a remote MCP server, set `MCP_PUBLIC_ORIGIN` to its public HTTPS origin so the client can reach the link.
