@@ -17,6 +17,9 @@ class Settings:
     max_bytes: int = 64 * 1024 * 1024
     public_origin: str = "http://localhost:8000"
     enable_raw_writes: bool = False
+    bot_token: str = field(default="", repr=False)
+    bot_chat_id: str = field(default="", repr=False)
+    bot_dedupe_db: Path | None = None
 
     def __post_init__(self):
         if not 1 <= self.port <= 65535 or self.timeout <= 0 or self.max_bytes <= 0:
@@ -38,12 +41,21 @@ class Settings:
     @classmethod
     def from_env(cls):
         load_dotenv(override=False)
+        data_dir = Path(os.getenv("CCC_DATA_DIR", "./data")).resolve()
+        dedupe_db = os.getenv("BOT_DEDUPE_DB")
         return cls(
-            data_dir=Path(os.getenv("CCC_DATA_DIR", "./data")).resolve(),
+            data_dir=data_dir,
             host=os.getenv("MCP_HOST", "127.0.0.1"),
             port=int(os.getenv("MCP_PORT", "8000")),
             timeout=float(os.getenv("CCC_TIMEOUT", "30")),
             max_bytes=int(os.getenv("CCC_MAX_FILE_BYTES", str(64 * 1024 * 1024))),
             public_origin=os.getenv("MCP_PUBLIC_ORIGIN", "http://localhost:8000"),
             enable_raw_writes=os.getenv("CCC_ENABLE_RAW_WRITES") == "1",
+            bot_token=os.getenv("BOT_TOKEN", ""),
+            bot_chat_id=os.getenv("BOT_CHAT_ID", ""),
+            bot_dedupe_db=(
+                Path(dedupe_db).resolve()
+                if dedupe_db
+                else data_dir / "telegram-sent.sqlite3"
+            ),
         )

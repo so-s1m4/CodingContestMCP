@@ -90,7 +90,12 @@ class AccountMiddleware:
             # Identity comes exclusively from CCC, not a caller-selected account ID.
             account = hashlib.sha256(user["uuid"].encode()).hexdigest()
             client.settings = replace(
-                client.settings, data_dir=self.settings.data_dir / "accounts" / account
+                client.settings,
+                data_dir=self.settings.data_dir / "accounts" / account,
+                bot_dedupe_db=(
+                    self.settings.bot_dedupe_db
+                    or self.settings.data_dir / "telegram-sent.sqlite3"
+                ),
             )
             try:
                 with self.game_sessions.use(account) as games:

@@ -2,14 +2,90 @@
 
 import base64
 import json
+import logging
+import sqlite3
 from typing import Any, Literal
 from urllib.parse import unquote
 
+import httpx
 from mcp.types import ImageContent
 
 from .context import current_service
-from .service import compact_progress, segment
+from .service import compact_progress, contest_slug, segment
+from .telegram_state import claim_solution, update_solution_status
 from .tools import _call, _params, local, result, tool
+
+logger = logging.getLogger(__name__)
+
+
+async def _notify_telegram_solution(
+    service, contest, level, file_id, filename, payload
+):
+    settings = service.client.settings
+    if not settings.bot_token or not settings.bot_chat_id:
+        return "disabled"
+
+    database = settings.bot_dedupe_db or settings.data_dir / "telegram-sent.sqlite3"
+    slug = contest_slug(contest)
+    try:
+        claimed = await local(
+            lambda: claim_solution(database, slug, level, str(file_id))
+        )
+    except (OSError, sqlite3.Error) as error:
+        logger.warning(
+            "Could not reserve Telegram notification: %s", type(error).__name__
+        )
+        return "failed"
+    if not claimed:
+        return "duplicate"
+
+    def tag(value):
+        safe = "".join(char if char.isalnum() or char == "_" else "_" for char in value)
+        return safe.strip("_") or "unknown"
+
+    url = f"https://api.telegram.org/bot{settings.bot_token}/sendDocument"
+    caption = (
+        f"Accepted solution: {slug}, level {level}, file {file_id}\n"
+        f"#contest_{tag(slug)} #level_{level} #file_{tag(str(file_id))}"
+    )
+    status = "uncertain"
+    try:
+        async with httpx.AsyncClient(timeout=settings.timeout) as client:
+            response = await client.post(
+                url,
+                data={"chat_id": settings.bot_chat_id, "caption": caption},
+                files={"document": (filename, payload, "application/octet-stream")},
+            )
+        body = response.json()
+        if isinstance(body, dict) and body.get("ok") is False:
+            status = "failed"
+            logger.warning(
+                "Telegram solution notification failed (HTTP %s)",
+                response.status_code,
+            )
+        elif response.is_success and isinstance(body, dict) and body.get("ok") is True:
+            status = "sent"
+        else:
+            logger.warning(
+                "Telegram solution notification returned an uncertain result (HTTP %s)",
+                response.status_code,
+            )
+    except (httpx.HTTPError, ValueError) as error:
+        logger.warning(
+            "Telegram solution notification failed: %s", type(error).__name__
+        )
+    try:
+        await local(
+            lambda: update_solution_status(
+                database, slug, level, str(file_id), status
+            )
+        )
+    except (OSError, sqlite3.Error) as error:
+        logger.warning(
+            "Could not update Telegram notification state: %s",
+            type(error).__name__,
+        )
+    return status
 
 
 @tool(read_only=False)
@@ -209,10 +285,15 @@ async def submit_solution(
                 lambda: current_service().artifacts.path(artifact_id).read_bytes()
             )
         )
-        feedback = await current_service().submit(
-            contest, level, file_id, payload, filename
-        )
+        service = current_service()
+        feedback = await service.submit(contest, level, file_id, payload, filename)
         evaluation = feedback.get("evaluation") if isinstance(feedback, dict) else None
+        if isinstance(evaluation, dict) and evaluation.get("isCorrect") is True:
+            notification_status = await _notify_telegram_solution(
+                service, contest, level, file_id, filename, payload
+            )
+            if isinstance(feedback, dict):
+                feedback["telegram_notification"] = notification_status
         cases = evaluation.get("cases") if isinstance(evaluation, dict) else None
         if (
             isinstance(cases, list)
