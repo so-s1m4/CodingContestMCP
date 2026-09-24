@@ -25,6 +25,27 @@ class TelegramPoolBot:
         self.pools = pools
         self.base = f"https://api.telegram.org/bot{settings.bot_token}"
         self.offset = 0
+        self.pending_actions = {}
+
+    @staticmethod
+    def _menu_markup():
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "🏠 Мои комнаты", "callback_data": "menu:rooms"},
+                    {"text": "⏳ Очередь", "callback_data": "menu:queue"},
+                ],
+                [
+                    {"text": "📤 История / повтор", "callback_data": "menu:history"},
+                    {"text": "➕ Создать комнату", "callback_data": "menu:create"},
+                ],
+                [
+                    {"text": "🔗 Подключить аккаунт", "callback_data": "menu:connect"},
+                    {"text": "➖ Отключить аккаунт", "callback_data": "menu:disconnect"},
+                ],
+                [{"text": "ℹ️ Помощь", "callback_data": "menu:help"}],
+            ]
+        }
 
     async def _telegram(self, method: str, **kwargs):
         async with httpx.AsyncClient(timeout=min(self.settings.timeout, 35)) as client:
@@ -36,9 +57,13 @@ class TelegramPoolBot:
             return body.get("result")
 
     async def _send(self, chat_id: int, text: str, reply_markup=None):
-        args = {"chat_id": chat_id, "text": text}
-        if reply_markup:
-            args["reply_markup"] = reply_markup
+        if reply_markup is None:
+            reply_markup = self._menu_markup()
+        elif isinstance(reply_markup, dict) and isinstance(reply_markup.get("inline_keyboard"), list):
+            reply_markup["inline_keyboard"].append(
+                [{"text": "🏠 Главное меню", "callback_data": "menu:home"}]
+            )
+        args = {"chat_id": chat_id, "text": text, "reply_markup": reply_markup}
         await self._telegram("sendMessage", **args)
 
     async def _poll_loop(self):
@@ -83,23 +108,35 @@ class TelegramPoolBot:
         if not isinstance(text, str):
             return
         parts = text.strip().split()
+        if str(user_id) in self.pending_actions and not text.strip().startswith("/"):
+            action = self.pending_actions.pop(str(user_id))
+            command = {"create": "/create_room", "connect": "/connect", "disconnect": "/disconnect"}[action]
+            parts = [command, *parts]
         command = parts[0].split("@", 1)[0].lower() if parts else ""
         user = str(user_id)
         try:
             if command in ("/start", "/help"):
                 await self._send(
                     chat_id,
-                    "Команды в личке:\n"
+                    "Панель управления комнатами и аккаунтами. Выберите действие кнопками ниже.\n\n"
+                    "Также доступны команды:\n"
                     "/create_room <комната> <пароль> — создать комнату\n"
                     "/connect <комната> <пароль> — подключить CCC-аккаунт через одноразовую HTTPS-форму\n"
                     "/disconnect <комната> — удалить свою сессию из комнаты\n"
                     "/rooms — показать ваши комнаты\n"
                     "/queue <комната> — показать ожидающие аккаунты и сроки\n"
-                    "/send_now <ID> — запустить одну выбранную отправку",
+                    "/send_now <ID> — запустить одну выбранную отправку\n"
+                    "/history <комната> — последние отправки с файлами для повтора\n"
+                    "/resend <ID> — повторить отправку выбранному аккаунту",
                 )
             elif command == "/create_room" and len(parts) == 3:
                 self.pools.create_room(parts[1], parts[2], user)
-                await self._send(chat_id, f"Комната {parts[1]} создана. Подключите аккаунт командой /connect.")
+                self.pools.set_active_room(parts[1], user)
+                await self._send(
+                    chat_id,
+                    f"Комната {parts[1]} создана. Подключите CCC-аккаунт кнопкой «Подключить аккаунт».",
+                    self._room_markup(parts[1]),
+                )
             elif command == "/connect" and len(parts) == 3:
                 if not self.settings.public_origin.startswith("https://"):
                     raise ValueError("Для подключения сессий нужен HTTPS в MCP_PUBLIC_ORIGIN")
@@ -122,12 +159,16 @@ class TelegramPoolBot:
                 )
             elif command == "/disconnect" and len(parts) == 2:
                 removed = self.pools.remove_member(parts[1], user)
+                if await asyncio.to_thread(self.pools.active_room, user) == parts[1]:
+                    await asyncio.to_thread(self.pools.set_active_room, None, user)
                 await self._send(chat_id, "Сессия отключена." if removed else "В этой комнате вашей сессии нет.")
             elif command == "/rooms" and len(parts) == 1:
                 rooms = self.pools.rooms_for_user(user)
                 await self._send(chat_id, "Комнаты: " + (", ".join(rooms) if rooms else "нет подключённых комнат"))
             elif command == "/queue" and len(parts) == 2:
                 await self._send_queue(chat_id, parts[1], user)
+            elif command == "/history" and len(parts) == 2:
+                await self._send_history(chat_id, parts[1], user)
             elif command == "/send_now" and len(parts) == 2 and parts[1].isdigit():
                 await asyncio.to_thread(
                     self.pools.release_job_now, int(parts[1]), user
@@ -135,6 +176,12 @@ class TelegramPoolBot:
                 await self._send(
                     chat_id,
                     f"Отправка #{parts[1]} для выбранного аккаунта поставлена на ближайшее время.",
+                )
+            elif command == "/resend" and len(parts) == 2 and parts[1].isdigit():
+                await asyncio.to_thread(self.pools.resend_job, int(parts[1]), user)
+                await self._send(
+                    chat_id,
+                    f"Повтор отправки #{parts[1]} выбранному аккаунту поставлен на ближайшее время.",
                 )
             else:
                 await self._send(chat_id, "Неизвестная команда или неверный формат. Отправьте /help.")
@@ -156,7 +203,7 @@ class TelegramPoolBot:
     async def _send_queue(self, chat_id: int, room: str, user_id: str):
         items = await asyncio.to_thread(self.pools.queue_snapshot, room, user_id)
         if not items:
-            await self._send(chat_id, f"Очередь комнаты {room} пуста.")
+            await self._send(chat_id, f"Очередь комнаты {room} пуста.", self._room_markup(room))
             return
         now = time.time()
         for start in range(0, len(items), 12):
@@ -178,7 +225,7 @@ class TelegramPoolBot:
             await self._send(
                 chat_id,
                 "\n".join(lines),
-                {"inline_keyboard": keyboard_rows},
+                {"inline_keyboard": keyboard_rows + self._room_markup(room)["inline_keyboard"]},
             )
 
     async def _handle_callback(self, callback):
@@ -194,27 +241,177 @@ class TelegramPoolBot:
                     text="Откройте бота в личном чате.", show_alert=True,
                 )
             return
-        if not isinstance(data, str) or not data.startswith("sendnow:"):
+        if not isinstance(data, str) or not data.startswith(("sendnow:", "resend:")):
+            if isinstance(data, str) and data.startswith("menu:"):
+                await self._handle_menu_callback(callback, data)
             return
-        raw_job_id = data.removeprefix("sendnow:")
+        action, raw_job_id = data.split(":", 1)
         if not raw_job_id.isdigit():
             return
         try:
-            await asyncio.to_thread(
-                self.pools.release_job_now, int(raw_job_id), str(sender["id"])
-            )
+            if action == "resend":
+                await asyncio.to_thread(
+                    self.pools.resend_job, int(raw_job_id), str(sender["id"])
+                )
+                message_text = f"Повтор отправки #{raw_job_id} выбранному аккаунту поставлен на ближайшее время."
+                callback_text = "Повтор для этого аккаунта запущен."
+            else:
+                await asyncio.to_thread(
+                    self.pools.release_job_now, int(raw_job_id), str(sender["id"])
+                )
+                message_text = f"Отправка #{raw_job_id} для выбранного аккаунта поставлена на ближайшее время."
+                callback_text = "Отправка для этого аккаунта запущена."
             await self._telegram(
                 "answerCallbackQuery", callback_query_id=callback_id,
-                text="Отправка для этого аккаунта запущена.",
+                text=callback_text,
             )
-            await self._send(
-                chat["id"],
-                f"Отправка #{raw_job_id} для выбранного аккаунта поставлена на ближайшее время.",
-            )
+            await self._send(chat["id"], message_text)
         except (ValueError, sqlite3.Error) as error:
             await self._telegram(
                 "answerCallbackQuery", callback_query_id=callback_id,
                 text=str(error)[:180], show_alert=True,
+            )
+
+    async def _handle_menu_callback(self, callback, data: str):
+        callback_id = callback.get("id")
+        sender = callback.get("from") or {}
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        if chat.get("type") != "private" or not isinstance(sender.get("id"), int):
+            if isinstance(callback_id, str):
+                await self._telegram(
+                    "answerCallbackQuery", callback_query_id=callback_id,
+                    text="Откройте меню в личном чате с ботом.", show_alert=True,
+                )
+            return
+        user_id = str(sender["id"])
+        action = data.removeprefix("menu:")
+        await self._telegram("answerCallbackQuery", callback_query_id=callback_id)
+        if action == "home":
+            await self._send(chat["id"], "Главное меню")
+        elif action == "rooms":
+            rooms = await asyncio.to_thread(self.pools.rooms_for_user, user_id)
+            if not rooms:
+                await self._send(chat["id"], "У вас пока нет комнат. Создайте свою или подключитесь к существующей.")
+            else:
+                keyboard = [
+                    [{"text": f"Открыть {room}", "callback_data": f"menu:open:{room}"}]
+                    for room in rooms
+                ]
+                await self._send(chat["id"], "Выберите комнату один раз — откроется её панель управления:", {"inline_keyboard": keyboard})
+        elif action == "queue":
+            room = await asyncio.to_thread(self.pools.active_room, user_id)
+            if room:
+                await self._send_queue(chat["id"], room, user_id)
+            else:
+                await self._show_room_picker(chat["id"], user_id, action)
+        elif action == "history":
+            room = await asyncio.to_thread(self.pools.active_room, user_id)
+            if room:
+                await self._send_history(chat["id"], room, user_id)
+            else:
+                await self._show_room_picker(chat["id"], user_id, action)
+        elif action == "disconnect":
+            await self._show_room_picker(chat["id"], user_id, action)
+        elif action in ("create", "connect"):
+            self.pending_actions[user_id] = action
+            prompt = (
+                "Отправьте название комнаты и пароль одним сообщением (через пробел).\n"
+                "Например: team-ccc длинный-пароль"
+                if action == "create"
+                else "Отправьте название комнаты и пароль комнаты одним сообщением (через пробел)."
+            )
+            await self._send(chat["id"], prompt)
+        elif action == "help":
+            await self._send(
+                chat["id"],
+                "Очередь показывает каждую ожидающую отправку и аккаунт. В истории можно повторить недавнюю отправку конкретному аккаунту. Файлы повтора хранятся 30 дней.",
+            )
+        elif action.startswith("open:"):
+            room = action.split(":", 1)[1]
+            rooms = await asyncio.to_thread(self.pools.rooms_for_user, user_id)
+            if room not in rooms:
+                await self._send(chat["id"], "Комната больше не доступна вашему аккаунту.")
+                return
+            await asyncio.to_thread(self.pools.set_active_room, room, user_id)
+            await self._send(chat["id"], f"Комната {room}", self._room_markup(room))
+        elif action.startswith(("roomqueue:", "roomhistory:", "roomdisconnect:")):
+            route, room = action.split(":", 1)
+            rooms = await asyncio.to_thread(self.pools.rooms_for_user, user_id)
+            if room not in rooms:
+                await self._send(chat["id"], "Комната больше не доступна вашему аккаунту.")
+                return
+            await asyncio.to_thread(self.pools.set_active_room, room, user_id)
+            if route == "roomqueue":
+                await self._send_queue(chat["id"], room, user_id)
+            elif route == "roomhistory":
+                await self._send_history(chat["id"], room, user_id)
+            else:
+                removed = await asyncio.to_thread(self.pools.remove_member, room, user_id)
+                if await asyncio.to_thread(self.pools.active_room, user_id) == room:
+                    await asyncio.to_thread(self.pools.set_active_room, None, user_id)
+                await self._send(
+                    chat["id"],
+                    "Сессия отключена." if removed else "В этой комнате вашей сессии нет.",
+                )
+
+    @staticmethod
+    def _room_markup(room: str):
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "⏳ Очередь", "callback_data": f"menu:roomqueue:{room}"},
+                    {"text": "📤 История и повторы", "callback_data": f"menu:roomhistory:{room}"},
+                ],
+                [{"text": "➖ Отключить мой аккаунт", "callback_data": f"menu:roomdisconnect:{room}"}],
+                [{"text": "🔄 Сменить комнату", "callback_data": "menu:rooms"}],
+            ]
+        }
+
+    async def _show_room_picker(self, chat_id: int, user_id: str, action: str):
+        rooms = await asyncio.to_thread(self.pools.rooms_for_user, user_id)
+        if not rooms:
+            await self._send(chat_id, "У вас пока нет подключённых комнат. Создайте комнату или подключитесь к существующей.")
+            return
+        keyboard = [
+            [{"text": f"Открыть {room}", "callback_data": f"menu:open:{room}"}]
+            for room in rooms
+        ]
+        await self._send(chat_id, "Выберите комнату:", {"inline_keyboard": keyboard})
+
+    async def _send_history(self, chat_id: int, room: str, user_id: str):
+        items = await asyncio.to_thread(self.pools.history_snapshot, room, user_id)
+        if not items:
+            await self._send(
+                chat_id,
+                f"В комнате {room} пока нет недавних отправок, для которых сохранён файл повтора.",
+                self._room_markup(room),
+            )
+            return
+        for start in range(0, len(items), 12):
+            chunk = items[start : start + 12]
+            lines = [f"Недавние отправки комнаты {room}:"]
+            keyboard_rows = []
+            for item in chunk:
+                label = item["telegram_label"] or item["telegram_user_id"]
+                account_suffix = item["target_uuid"][-6:]
+                status = {"sent": "принято", "rejected": "отклонено", "failed": "ошибка"}.get(
+                    item["status"], item["status"]
+                )
+                lines.append(
+                    f"• #{item['job_id']} · {label} · CCC…{account_suffix} · {status}\n"
+                    f"  {item['contest']} · уровень {item['level']} · файл {item['file_id']}"
+                )
+                keyboard_rows.append(
+                    [{
+                        "text": f"Повторить #{item['job_id']} для {label}"[:60],
+                        "callback_data": f"resend:{item['job_id']}",
+                    }]
+                )
+            await self._send(
+                chat_id,
+                "\n".join(lines),
+                {"inline_keyboard": keyboard_rows + self._room_markup(room)["inline_keyboard"]},
             )
 
     async def _deliver_one(self):

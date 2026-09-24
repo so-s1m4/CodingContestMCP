@@ -13,6 +13,8 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
+RESEND_RETENTION_SECONDS = 30 * 24 * 60 * 60
+
 
 class SessionPools:
     def __init__(self, database: Path, encryption_key: str):
@@ -71,6 +73,11 @@ class SessionPools:
                     next_send_at REAL NOT NULL,
                     PRIMARY KEY (room, account_uuid)
                 );
+                CREATE TABLE IF NOT EXISTS telegram_user_preferences (
+                    telegram_user_id TEXT PRIMARY KEY,
+                    active_room TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 """
             )
             for table, column, column_type, default in (
@@ -86,6 +93,11 @@ class SessionPools:
                     connection.execute(
                         f"ALTER TABLE {table} ADD COLUMN {column} {column_type} NOT NULL DEFAULT {default}"
                     )
+            connection.execute(
+                """UPDATE telegram_fanout_queue SET payload = X''
+                   WHERE status IN ('sent', 'rejected', 'failed') AND created_at < ?""",
+                (time.time() - RESEND_RETENTION_SECONDS,),
+            )
 
     @staticmethod
     def _password_hash(password: str, salt: bytes) -> bytes:
@@ -210,6 +222,34 @@ class SessionPools:
                 ).fetchall()
             ]
 
+    def set_active_room(self, room: str | None, telegram_user_id: str):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            if room is None:
+                connection.execute(
+                    "DELETE FROM telegram_user_preferences WHERE telegram_user_id = ?",
+                    (telegram_user_id,),
+                )
+                return
+            if not self._can_manage_room(connection, room, telegram_user_id):
+                raise ValueError("Room not found or you are not a room member")
+            connection.execute(
+                """INSERT INTO telegram_user_preferences
+                   (telegram_user_id, active_room, updated_at) VALUES (?, ?, ?)
+                   ON CONFLICT(telegram_user_id) DO UPDATE SET
+                     active_room=excluded.active_room, updated_at=excluded.updated_at""",
+                (telegram_user_id, room, time.time()),
+            )
+
+    def active_room(self, telegram_user_id: str):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            row = connection.execute(
+                "SELECT active_room FROM telegram_user_preferences WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            ).fetchone()
+            if not row or not self._can_manage_room(connection, row[0], telegram_user_id):
+                return None
+            return row[0]
+
     def _can_manage_room(self, connection, room: str, telegram_user_id: str) -> bool:
         return connection.execute(
             """SELECT 1 FROM telegram_rooms WHERE name = ? AND owner_id = ?
@@ -261,6 +301,66 @@ class SessionPools:
                 raise ValueError("Room not found or you are not a room member")
             connection.execute(
                 "UPDATE telegram_fanout_queue SET run_after = ?, manual = 1 WHERE id = ?",
+                (time.time(), job_id),
+            )
+            return True
+
+    def history_snapshot(self, room: str, telegram_user_id: str, limit: int = 20):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            if not self._can_manage_room(connection, room, telegram_user_id):
+                raise ValueError("Room not found or you are not a room member")
+            rows = connection.execute(
+                """SELECT q.id, q.contest, q.level, q.file_id, q.target_uuid,
+                          m.telegram_label, m.telegram_user_id, q.status, q.detail,
+                          q.created_at
+                   FROM telegram_fanout_queue q
+                   JOIN telegram_room_members m
+                     ON m.room = q.room AND m.account_uuid = q.target_uuid
+                   WHERE q.room = ? AND q.status IN ('sent', 'rejected', 'failed')
+                     AND length(q.payload) > 0
+                   ORDER BY q.created_at DESC, q.id DESC LIMIT ?""",
+                (room, max(1, min(limit, 50))),
+            ).fetchall()
+        return [
+            {
+                "job_id": row[0],
+                "contest": row[1],
+                "level": row[2],
+                "file_id": row[3],
+                "target_uuid": row[4],
+                "telegram_label": row[5],
+                "telegram_user_id": row[6],
+                "status": row[7],
+                "detail": row[8],
+                "created_at": row[9],
+            }
+            for row in rows
+        ]
+
+    def resend_job(self, job_id: int, telegram_user_id: str):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            job = connection.execute(
+                """SELECT room, target_uuid, status, payload, created_at
+                   FROM telegram_fanout_queue WHERE id = ?""",
+                (job_id,),
+            ).fetchone()
+            if not job or not self._can_manage_room(connection, job[0], telegram_user_id):
+                raise ValueError("Отправка не найдена или у вас нет доступа к комнате")
+            if job[2] not in ("sent", "rejected", "failed"):
+                raise ValueError("Повторить можно только завершённую отправку")
+            if not job[3] or job[4] < time.time() - RESEND_RETENTION_SECONDS:
+                raise ValueError("Файл для повтора больше не хранится")
+            member = connection.execute(
+                """SELECT 1 FROM telegram_room_members
+                   WHERE room = ? AND account_uuid = ?""",
+                (job[0], job[1]),
+            ).fetchone()
+            if not member:
+                raise ValueError("Аккаунт отключён от комнаты; сначала подключите его снова")
+            connection.execute(
+                """UPDATE telegram_fanout_queue
+                   SET status = 'queued', run_after = ?, manual = 1, detail = NULL
+                   WHERE id = ?""",
                 (time.time(), job_id),
             )
             return True
@@ -361,6 +461,6 @@ class SessionPools:
                         (row[0], row[1], next_send_at),
                     )
             connection.execute(
-                "UPDATE telegram_fanout_queue SET status = ?, detail = ?, payload = X'' WHERE id = ?",
+                "UPDATE telegram_fanout_queue SET status = ?, detail = ? WHERE id = ?",
                 (status, detail, job_id),
             )

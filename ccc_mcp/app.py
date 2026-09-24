@@ -421,6 +421,9 @@ class AccountMiddleware:
                 self.session_pools.save_member,
                 room, telegram_user_id, account_uuid, session, telegram_label,
             )
+            await asyncio.to_thread(
+                self.session_pools.set_active_room, room, telegram_user_id
+            )
             if self.settings.bot_token:
                 try:
                     async with httpx.AsyncClient(
