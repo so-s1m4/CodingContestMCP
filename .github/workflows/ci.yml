@@ -35,4 +35,25 @@ jobs:
       - name: Trigger deployment
         env:
           DEPLOY_HOOK_URL: ${{ secrets.DEPLOY_HOOK_URL }}
-        run: curl --fail --silent --show-error --request POST "$DEPLOY_HOOK_URL"
+          DEPLOY_REF: ${{ github.ref }}
+          DEPLOY_REPOSITORY: ${{ github.repository }}
+          DEPLOY_SHA: ${{ github.sha }}
+          DEPLOY_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          payload="$(jq -n \
+            --arg ref "$DEPLOY_REF" \
+            --arg repository "$DEPLOY_REPOSITORY" \
+            --arg sha "$DEPLOY_SHA" \
+            --arg message "$DEPLOY_COMMIT_MESSAGE" \
+            '{ref:$ref,repository:{full_name:$repository},head_commit:{id:$sha,message:$message}}')"
+          response="$(curl --silent --show-error --request POST \
+            --header 'X-GitHub-Event: push' \
+            --header 'Content-Type: application/json' \
+            --data-binary "$payload" \
+            "$DEPLOY_HOOK_URL")"
+          message="$(jq -r '.message // empty' <<< "$response")"
+          if [[ "$message" != 'Application deployed successfully' ]]; then
+            echo "::error::Deploy hook rejected the push: ${message:-invalid response}"
+            exit 1
+          fi
+          echo "$message"
