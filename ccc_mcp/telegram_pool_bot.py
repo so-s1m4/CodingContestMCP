@@ -1,10 +1,9 @@
-"""Private Telegram enrollment and delayed, room-scoped accepted submissions."""
+"""Private Telegram enrollment and room-scoped accepted submissions."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import re
 import secrets
 import sqlite3
@@ -40,6 +39,7 @@ class TelegramPoolBot:
         self.pending_actions = {}
         self.callback_source_message_id = None
         self.replay_flows = {}
+        self.queue_wakeup = asyncio.Event()
 
     async def _recipient_contest(self, client: CCCClient, job) -> str:
         game_slug = job.get("game_slug")
@@ -329,22 +329,12 @@ class TelegramPoolBot:
             )
             await self._send(chat_id, "Не удалось выполнить команду. Проверьте комнату и пароль.")
 
-    @staticmethod
-    def _eta(seconds: float) -> str:
-        remaining = max(0, math.ceil(seconds))
-        if remaining == 0:
-            return "сейчас"
-        if remaining < 60:
-            return f"{remaining} сек"
-        return f"{math.ceil(remaining / 60)} мин"
-
     async def _send_queue(self, chat_id: int, room: str, user_id: str):
         is_owner = await asyncio.to_thread(self.pools.is_room_owner, room, user_id)
         items = await asyncio.to_thread(self.pools.queue_snapshot, room, user_id)
         if not items:
             await self._send(chat_id, f"Очередь комнаты {room} пуста.", self._room_markup(room, is_owner))
             return
-        now = time.time()
         for start in range(0, len(items), 12):
             chunk = items[start : start + 12]
             lines = [f"Ожидающие отправки в комнате {room} ({start + 1}–{start + len(chunk)} из {len(items)}):"]
@@ -352,11 +342,10 @@ class TelegramPoolBot:
             for item in chunk:
                 label = item["telegram_label"] or item["telegram_user_id"]
                 account_suffix = item["target_uuid"][-6:]
-                eta = self._eta(item["due_at"] - now)
                 status_text = (
                     "  отправляется сейчас"
                     if item["status"] == "sending"
-                    else f"  отправка через {eta}"
+                    else "  ожидает отправки"
                 )
                 lines.append(
                     f"• #{item['job_id']} · {label} · CCC…{account_suffix}\n"
@@ -478,7 +467,7 @@ class TelegramPoolBot:
             await self._send(
                 chat["id"],
                 f"Подтвердить запуск всех {count} ожидающих отправок комнаты {room}?\n"
-                "Случайная задержка между аккаунтами и ограничения частоты для каждого аккаунта сохранятся.",
+                "Все ожидающие отправки будут переданы worker сразу.",
                 {"inline_keyboard": [[
                     {"text": f"✅ Подтвердить все ({count})", "callback_data": f"queueall:confirm:{room}"},
                     {"text": "Отмена", "callback_data": f"queueall:cancel:{room}"},
@@ -758,6 +747,7 @@ class TelegramPoolBot:
                     self.pools.resend_level,
                     flow["room"], game["contest"], level, selected, flow["owner"],
                 )
+                self.queue_wakeup.set()
                 self.replay_flows.pop(flow_id, None)
                 text = (
                     f"✅ Level {level} поставлен на повтор: {outcome['queued']} файлов "
@@ -765,7 +755,7 @@ class TelegramPoolBot:
                 )
                 if outcome["already_active"]:
                     text += f"\nУже в очереди или отправляются: {outcome['already_active']} файловых отправок."
-                text += "\nОтправки идут с обычными случайными задержками."
+                text += "\nВсе файлы отправляются без искусственных задержек."
                 await self._send(chat_id, text, self._room_markup(flow["room"], True))
             except (ValueError, sqlite3.Error) as error:
                 await self._send(chat_id, str(error)[:500], self._room_markup(flow["room"], True))
@@ -795,10 +785,15 @@ class TelegramPoolBot:
             count = await asyncio.to_thread(
                 self.pools.release_queued_batch, room, str(sender["id"])
             )
+            self.queue_wakeup.set()
             await self._send(
                 chat["id"],
-                f"🚀 Запущено {count} ожидающих отправок. Между отправками сохраняются задержки.",
-                self._room_markup(room, True),
+                f"🚀 В работу сразу передано {count} отправок без искусственных задержек. Статус можно посмотреть в очереди.",
+                {
+                    "inline_keyboard": [[
+                        {"text": "⏳ Смотреть очередь", "callback_data": f"menu:roomqueue:{room}"}
+                    ]]
+                },
             )
         except (ValueError, sqlite3.Error) as error:
             await self._send(chat["id"], str(error)[:500])
@@ -939,7 +934,12 @@ class TelegramPoolBot:
                     last_recovery = now
                 delivered = await self._deliver_one()
                 if not delivered:
-                    await asyncio.sleep(2)
+                    try:
+                        await asyncio.wait_for(self.queue_wakeup.wait(), timeout=2)
+                    except asyncio.TimeoutError:
+                        pass
+                    else:
+                        self.queue_wakeup.clear()
             except asyncio.CancelledError:
                 raise
             except Exception as error:
