@@ -1,9 +1,13 @@
 """Contest-scoped tools; importing this module registers them."""
 
 import base64
+import asyncio
 import json
 import logging
 import sqlite3
+import tempfile
+import zipfile
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import unquote
 
@@ -13,10 +17,19 @@ from mcp.types import ImageContent
 from .context import current_service
 from .download_links import download_links
 from .service import compact_progress, contest_slug, segment
-from .telegram_state import claim_solution, update_solution_status
+from .telegram_state import (
+    claim_solution,
+    delete_solution_payloads,
+    get_solution_batch,
+    save_solution_batch,
+    save_solution_payload,
+    solution_payloads,
+    update_solution_status,
+)
 from .tools import _call, _params, local, result, tool
 
 logger = logging.getLogger(__name__)
+_telegram_batch_locks = {}
 
 
 async def _notify_telegram_solution(
@@ -28,73 +41,230 @@ async def _notify_telegram_solution(
 
     database = settings.bot_dedupe_db or settings.data_dir / "telegram-sent.sqlite3"
     slug = contest_slug(contest)
-    try:
-        claimed = await local(
-            lambda: claim_solution(database, slug, level, str(file_id))
-        )
-    except (OSError, sqlite3.Error) as error:
-        logger.warning(
-            "Could not reserve Telegram notification: %s", type(error).__name__
-        )
-        return "failed"
-    if not claimed:
-        return "duplicate"
-
     def tag(value):
         safe = "".join(char if char.isalnum() or char == "_" else "_" for char in value)
         return safe.strip("_") or "unknown"
 
-    url = f"https://api.telegram.org/bot{settings.bot_token}/sendDocument"
-    caption = (
-        f"Accepted solution: {slug}, level {level}, file {file_id}\n"
-        f"#contest_{tag(slug)} #level_{level} #file_{tag(str(file_id))}"
-    )
-    status = "uncertain"
-    detail = None
-    try:
-        async with httpx.AsyncClient(timeout=settings.timeout) as client:
-            response = await client.post(
-                url,
-                data={"chat_id": settings.bot_chat_id, "caption": caption},
-                files={"document": (filename, payload, "application/octet-stream")},
+    lock_key = (str(database.resolve()), slug, level)
+    lock = _telegram_batch_locks.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        try:
+            claimed = await local(
+                lambda: claim_solution(database, slug, level, str(file_id))
             )
-        body = response.json()
-        if isinstance(body, dict) and body.get("ok") is False:
-            status = "failed"
-            description = body.get("description")
+            if not claimed:
+                return "duplicate"
+            await local(
+                lambda: save_solution_payload(
+                    database, slug, level, str(file_id), filename, payload
+                )
+            )
+            batch = await local(lambda: get_solution_batch(database, slug, level))
+            expected_files = batch["expected_files"]
+            if not expected_files:
+                try:
+                    info = await service.info(contest)
+                    level_info = next(
+                        (
+                            item
+                            for item in info.get("levels", [])
+                            if item.get("level") == level
+                        ),
+                        {},
+                    )
+                    expected_files = [
+                        str(item)
+                        for item in level_info.get("inputFiles", [])
+                        if isinstance(item, (str, int))
+                    ]
+                except Exception as error:
+                    logger.info(
+                        "Could not load expected Telegram batch files: %s",
+                        type(error).__name__,
+                    )
+            entries = await local(lambda: solution_payloads(database, slug, level))
+            if not entries:
+                return "failed"
+
+            accepted_ids = {entry["file_id"] for entry in entries}
+            if expected_files:
+                passed = len(accepted_ids.intersection(expected_files))
+                progress = f"{passed}/{len(expected_files)} files passed"
+                complete = set(expected_files).issubset(accepted_ids)
+            else:
+                progress = f"{len(entries)} files passed"
+                complete = False
+            refresh_archive = not batch["message_id"] or complete or not expected_files
+            caption = (
+                f"✅ {slug} · Level {level} · {progress}\n"
+                f"#contest_{tag(slug)} #level_{level}"
+            )
+            if expected_files and not complete:
+                caption += "\nПолный архив обновится, когда пройдут все файлы уровня."
+
+            if refresh_archive:
+                def build_archive():
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".zip", dir=database.parent, delete=False
+                    ) as archive_file:
+                        archive_path = Path(archive_file.name)
+                    manifest = [
+                        f"Contest: {slug}",
+                        f"Level: {level}",
+                        f"Progress: {progress}",
+                        "",
+                        "Accepted files:",
+                    ]
+                    with zipfile.ZipFile(
+                        archive_path, "w", compression=zipfile.ZIP_DEFLATED
+                    ) as archive:
+                        for entry in entries:
+                            safe_id = tag(entry["file_id"])
+                            safe_name = Path(entry["filename"]).name
+                            safe_name = "".join(
+                                char
+                                if char.isalnum() or char in "._-"
+                                else "_"
+                                for char in safe_name
+                            ) or "solution.out"
+                            archive.write(
+                                entry["path"], f"answers/{safe_id}-{safe_name}"
+                            )
+                            manifest.append(
+                                f"- {entry['file_id']}: {entry['filename']} (accepted)"
+                            )
+                        archive.writestr("summary.txt", "\n".join(manifest) + "\n")
+                    return archive_path
+
+                archive_path = await local(build_archive)
+            else:
+                archive_path = None
+            method = (
+                "sendDocument"
+                if not batch["message_id"]
+                else "editMessageMedia"
+                if refresh_archive
+                else "editMessageCaption"
+            )
+            url = f"https://api.telegram.org/bot{settings.bot_token}/{method}"
+            if method == "editMessageMedia":
+                media = json.dumps(
+                    {
+                        "type": "document",
+                        "media": "attach://document",
+                        "caption": caption,
+                    }
+                )
+                data = {
+                    "chat_id": settings.bot_chat_id,
+                    "message_id": batch["message_id"],
+                    "media": media,
+                }
+            elif method == "editMessageCaption":
+                data = {
+                    "chat_id": settings.bot_chat_id,
+                    "message_id": batch["message_id"],
+                    "caption": caption,
+                }
+            else:
+                data = {"chat_id": settings.bot_chat_id, "caption": caption}
+            status = "uncertain"
+            detail = None
+            try:
+                async with httpx.AsyncClient(timeout=settings.timeout) as client:
+                    if archive_path:
+                        with archive_path.open("rb") as document:
+                            response = await client.post(
+                                url,
+                                data=data,
+                                files={
+                                    "document": (
+                                        f"{tag(slug)}-level-{level}-solutions.zip",
+                                        document,
+                                        "application/zip",
+                                    )
+                                },
+                            )
+                    else:
+                        response = await client.post(url, data=data)
+                body = response.json()
+                result_body = body.get("result") if isinstance(body, dict) else None
+                message_id = (
+                    result_body.get("message_id")
+                    if isinstance(result_body, dict)
+                    else batch["message_id"]
+                )
+                if (
+                    response.is_success
+                    and isinstance(body, dict)
+                    and body.get("ok") is True
+                    and isinstance(message_id, int)
+                ):
+                    await local(
+                        lambda: save_solution_batch(
+                            database,
+                            slug,
+                            level,
+                            message_id,
+                            expected_files,
+                        )
+                    )
+                    status = "updated" if batch["message_id"] else "sent"
+                elif isinstance(body, dict) and body.get("ok") is False:
+                    status = "failed"
+                    description = body.get("description")
+                    detail = (
+                        description[:300]
+                        if isinstance(description, str)
+                        else "Telegram Bot API rejected the request"
+                    )
+                    logger.warning(
+                        "Telegram level bundle failed (HTTP %s): %s",
+                        response.status_code,
+                        detail,
+                    )
+                else:
+                    logger.warning(
+                        "Telegram level bundle returned an uncertain result (HTTP %s)",
+                        response.status_code,
+                    )
+            except (httpx.HTTPError, ValueError, OSError) as error:
+                logger.warning(
+                    "Telegram level bundle failed: %s", type(error).__name__
+                )
+            finally:
+                if archive_path:
+                    try:
+                        archive_path.unlink()
+                    except FileNotFoundError:
+                        pass
+            await local(
+                lambda: update_solution_status(
+                    database, slug, level, str(file_id), status
+                )
+            )
+            if (
+                status in ("sent", "updated")
+                and expected_files
+                and set(expected_files).issubset(accepted_ids)
+            ):
+                await local(
+                    lambda: delete_solution_payloads(database, slug, level)
+                )
+            return f"{status}: {detail}" if detail else status
+        except (OSError, sqlite3.Error) as error:
             logger.warning(
-                "Telegram solution notification failed (HTTP %s): %s",
-                response.status_code,
-                description if isinstance(description, str) else "Bot API rejected the request",
+                "Could not update Telegram level bundle: %s", type(error).__name__
             )
-            detail = (
-                description[:300]
-                if isinstance(description, str)
-                else "Telegram Bot API rejected the request"
-            )
-        elif response.is_success and isinstance(body, dict) and body.get("ok") is True:
-            status = "sent"
-        else:
-            logger.warning(
-                "Telegram solution notification returned an uncertain result (HTTP %s)",
-                response.status_code,
-            )
-    except (httpx.HTTPError, ValueError) as error:
-        logger.warning(
-            "Telegram solution notification failed: %s", type(error).__name__
-        )
-    try:
-        await local(
-            lambda: update_solution_status(
-                database, slug, level, str(file_id), status
-            )
-        )
-    except (OSError, sqlite3.Error) as error:
-        logger.warning(
-            "Could not update Telegram notification state: %s",
-            type(error).__name__,
-        )
-    return f"{status}: {detail}" if detail else status
+            try:
+                await local(
+                    lambda: update_solution_status(
+                        database, slug, level, str(file_id), "failed"
+                    )
+                )
+            except (OSError, sqlite3.Error):
+                pass
+            return "failed"
 
 
 @tool(read_only=False)

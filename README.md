@@ -12,7 +12,7 @@ cp .env.example .env
 docker compose up --build -d
 ```
 
-When both Telegram settings are present, the server sends a startup message and each accepted contest, level and input-file combination to the configured Telegram chat once. It stores sent-file keys in `CCC_DATA_DIR/telegram-sent.sqlite3` by default, and adds contest, level and file hashtags to each solution message. `submit_solution` returns `telegram_notification` with `sent`, `duplicate`, `disabled`, or a failure reason. Set `BOT_DEDUPE_DB` to an absolute path to override the database location.
+When both Telegram settings are present, the server sends a startup message and keeps one editable solution message per contest and level. Accepted outputs are collected into a ZIP attached to that message; each later accepted file updates the same Telegram message and archive. The server stores sent-file keys in `CCC_DATA_DIR/telegram-sent.sqlite3` by default. `submit_solution` returns `telegram_notification` with `sent`, `updated`, `duplicate`, `disabled`, or a failure reason. Set `BOT_DEDUPE_DB` to an absolute path to override the database location.
 
 Or with Python 3.12+: `pip install -r requirements.txt && python server.py`.
 
