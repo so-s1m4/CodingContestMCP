@@ -11,9 +11,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
 COPY ccc_mcp ./ccc_mcp
+COPY container_entrypoint.py .
 RUN useradd --uid 10001 --create-home mcp && mkdir -p /app/data/inbox && chown -R mcp:mcp /app/data
-USER mcp
 VOLUME ["/app/data"]
 
 EXPOSE 8000
-CMD ["python", "server.py"]
+CMD ["python", "container_entrypoint.py"]
