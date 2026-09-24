@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
+import secrets
 import sqlite3
 import time
 import traceback
@@ -37,6 +39,7 @@ class TelegramPoolBot:
         self.offset = 0
         self.pending_actions = {}
         self.callback_source_message_id = None
+        self.replay_flows = {}
 
     async def _recipient_contest(self, client: CCCClient, job) -> str:
         game_slug = job.get("game_slug")
@@ -388,6 +391,12 @@ class TelegramPoolBot:
         self.callback_source_message_id = (
             source_message_id if isinstance(source_message_id, int) else None
         )
+        if isinstance(data, str) and data.startswith("replay:"):
+            await self._handle_replay_callback(callback, data)
+            return
+        if isinstance(data, str) and data.startswith("queueall:"):
+            await self._handle_queueall_callback(callback, data)
+            return
         if not isinstance(data, str) or not data.startswith(("sendnow:", "resend:")):
             if isinstance(data, str) and data.startswith("menu:"):
                 await self._handle_menu_callback(callback, data)
@@ -436,6 +445,45 @@ class TelegramPoolBot:
         await self._telegram("answerCallbackQuery", callback_query_id=callback_id)
         if action == "home":
             await self._send(chat["id"], "Главное меню")
+        elif action.startswith("replay:"):
+            room = action.split(":", 1)[1]
+            if not await asyncio.to_thread(self.pools.is_room_owner, room, user_id):
+                await self._send(chat["id"], "Повторной отправкой уровня управляет только создатель комнаты.")
+                return
+            catalog = await asyncio.to_thread(self.pools.resend_catalog, room, user_id)
+            if not catalog:
+                await self._send(
+                    chat["id"],
+                    "Для этой комнаты пока нет сохранённых файлов уровней для повтора.",
+                    self._room_markup(room, True),
+                )
+                return
+            flow_id = secrets.token_urlsafe(6).rstrip("=")
+            self.replay_flows[flow_id] = {
+                "owner": user_id,
+                "room": room,
+                "catalog": catalog,
+            }
+            await self._render_replay_games(chat["id"], flow_id)
+        elif action.startswith("queueall:"):
+            room = action.split(":", 1)[1]
+            if not await asyncio.to_thread(self.pools.is_room_owner, room, user_id):
+                await self._send(chat["id"], "Управлять очередью может только создатель комнаты.")
+                return
+            items = await asyncio.to_thread(self.pools.queue_snapshot, room, user_id)
+            count = sum(item["status"] == "queued" for item in items)
+            if not count:
+                await self._send(chat["id"], "В очереди нет ожидающих отправок.", self._room_markup(room, True))
+                return
+            await self._send(
+                chat["id"],
+                f"Подтвердить запуск всех {count} ожидающих отправок комнаты {room}?\n"
+                "Случайная задержка между аккаунтами и ограничения частоты для каждого аккаунта сохранятся.",
+                {"inline_keyboard": [[
+                    {"text": f"✅ Подтвердить все ({count})", "callback_data": f"queueall:confirm:{room}"},
+                    {"text": "Отмена", "callback_data": f"queueall:cancel:{room}"},
+                ]]},
+            )
         elif action == "rooms":
             rooms = await asyncio.to_thread(self.pools.rooms_for_user, user_id)
             if not rooms:
@@ -518,6 +566,10 @@ class TelegramPoolBot:
                     {"text": "⏳ Очередь", "callback_data": f"menu:roomqueue:{room}"},
                     {"text": "📤 История и повторы", "callback_data": f"menu:roomhistory:{room}"},
                 ],
+                [
+                    {"text": "🔁 Повторить уровень", "callback_data": f"menu:replay:{room}"},
+                    {"text": "🚀 Подтвердить очередь", "callback_data": f"menu:queueall:{room}"},
+                ],
                 [{"text": "👥 Подключённые аккаунты", "callback_data": f"menu:roommembers:{room}"}],
             ])
         keyboard.append([{"text": "➖ Отключить мой аккаунт", "callback_data": f"menu:roomdisconnect:{room}"}])
@@ -525,6 +577,231 @@ class TelegramPoolBot:
         return {
             "inline_keyboard": keyboard
         }
+
+    @staticmethod
+    def _game_label(game):
+        slug = game.get("game_slug")
+        if not isinstance(slug, str) or not slug:
+            return game["contest"]
+        display = slug.removeprefix("training-").removeprefix("ccc-")
+        display = re.sub(r"^\d{4}[-._]\d{1,2}[-._]", "", display)
+        display = display.removeprefix("school-").replace("-", " ").title()
+        suffix = game["contest"].rsplit("-", 1)[-1]
+        return f"{display} · {suffix}"
+
+    async def _render_replay_games(self, chat_id: int, flow_id: str):
+        flow = self.replay_flows[flow_id]
+        keyboard = [
+            [{
+                "text": self._game_label(game)[:60],
+                "callback_data": f"replay:game:{flow_id}:{index}",
+            }]
+            for index, game in enumerate(flow["catalog"])
+        ]
+        keyboard.append([{"text": "Отмена", "callback_data": f"replay:cancel:{flow_id}"}])
+        await self._send(chat_id, "Выберите игру:", {"inline_keyboard": keyboard})
+
+    async def _render_replay_levels(self, chat_id: int, flow_id: str):
+        flow = self.replay_flows[flow_id]
+        game = flow["catalog"][flow["game_index"]]
+        keyboard = [
+            [{
+                "text": f"Level {item['level']} · {item['files']} сохранённых файлов",
+                "callback_data": f"replay:level:{flow_id}:{index}",
+            }]
+            for index, item in enumerate(game["levels"])
+        ]
+        keyboard.extend([
+            [{"text": "← К выбору игры", "callback_data": f"replay:games:{flow_id}"}],
+            [{"text": "Отмена", "callback_data": f"replay:cancel:{flow_id}"}],
+        ])
+        await self._send(
+            chat_id,
+            f"{self._game_label(game)}\nВыберите уровень для полного повтора:",
+            {"inline_keyboard": keyboard},
+        )
+
+    async def _render_replay_targets(self, chat_id: int, flow_id: str):
+        flow = self.replay_flows[flow_id]
+        if "members" not in flow:
+            flow["members"] = await asyncio.to_thread(
+                self.pools.members_snapshot, flow["room"], flow["owner"]
+            )
+            flow["member_tokens"] = {}
+            for member in flow["members"]:
+                token = secrets.token_urlsafe(5).rstrip("=")
+                flow["member_tokens"][token] = member["account_uuid"]
+        selected = flow.setdefault("selected", set())
+        page = flow.get("page", 0)
+        page_size = 8
+        members = flow["members"]
+        page_count = max(1, (len(members) + page_size - 1) // page_size)
+        page = max(0, min(page, page_count - 1))
+        flow["page"] = page
+        keyboard = []
+        for member in members[page * page_size : (page + 1) * page_size]:
+            token = next(
+                token for token, account_uuid in flow["member_tokens"].items()
+                if account_uuid == member["account_uuid"]
+            )
+            checked = member["account_uuid"] in selected
+            label = member["telegram_label"] or member["telegram_user_id"]
+            keyboard.append([{
+                "text": f"{'✅' if checked else '⬜'} {label} · CCC…{member['account_uuid'][-6:]}"[:60],
+                "callback_data": f"replay:toggle:{flow_id}:{token}",
+            }])
+        keyboard.append([
+            {"text": "Выбрать всех", "callback_data": f"replay:all:{flow_id}"},
+            {"text": "Снять выбор", "callback_data": f"replay:none:{flow_id}"},
+        ])
+        if page_count > 1:
+            keyboard.append([
+                {"text": "←", "callback_data": f"replay:page:{flow_id}:{page - 1}"}
+                if page > 0 else {"text": "·", "callback_data": f"replay:page:{flow_id}:0"},
+                {"text": f"{page + 1}/{page_count}", "callback_data": f"replay:page:{flow_id}:{page}"},
+                {"text": "→", "callback_data": f"replay:page:{flow_id}:{page + 1}"}
+                if page + 1 < page_count else {"text": "·", "callback_data": f"replay:page:{flow_id}:{page}"},
+            ])
+        keyboard.append([
+            {"text": "← Уровни", "callback_data": f"replay:levels:{flow_id}"},
+            {"text": f"✅ Повторить ({len(selected)})", "callback_data": f"replay:confirm:{flow_id}"},
+        ])
+        keyboard.append([{"text": "Отмена", "callback_data": f"replay:cancel:{flow_id}"}])
+        game = flow["catalog"][flow["game_index"]]
+        level = game["levels"][flow["level_index"]]
+        await self._send(
+            chat_id,
+            f"{self._game_label(game)} · Level {level['level']} · {level['files']} сохранённых файлов\n"
+            f"Выбрано аккаунтов: {len(selected)}. Можно выбрать одного или нескольких.",
+            {"inline_keyboard": keyboard},
+        )
+
+    async def _handle_replay_callback(self, callback, data: str):
+        callback_id = callback.get("id")
+        sender = callback.get("from") or {}
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        parts = data.split(":")
+        if chat.get("type") != "private" or not isinstance(sender.get("id"), int):
+            await self._telegram(
+                "answerCallbackQuery", callback_query_id=callback_id,
+                text="Откройте меню в личном чате с ботом.", show_alert=True,
+            )
+            return
+        if len(parts) < 3:
+            return
+        action, flow_id = parts[1], parts[2]
+        flow = self.replay_flows.get(flow_id)
+        if not flow or flow["owner"] != str(sender["id"]):
+            await self._telegram(
+                "answerCallbackQuery", callback_query_id=callback_id,
+                text="Это меню устарело. Откройте повтор уровня заново.", show_alert=True,
+            )
+            return
+        if action == "confirm" and not flow.get("selected"):
+            await self._telegram(
+                "answerCallbackQuery", callback_query_id=callback_id,
+                text="Сначала выберите аккаунт.", show_alert=True,
+            )
+            return
+        await self._telegram("answerCallbackQuery", callback_query_id=callback_id)
+        chat_id = chat["id"]
+        if action == "cancel":
+            self.replay_flows.pop(flow_id, None)
+            await self._send(chat_id, "Повтор уровня отменён.", self._room_markup(flow["room"], True))
+        elif action == "game" and len(parts) == 4 and parts[3].isdigit():
+            index = int(parts[3])
+            if index >= len(flow["catalog"]):
+                return
+            flow["game_index"] = index
+            await self._render_replay_levels(chat_id, flow_id)
+        elif action == "games":
+            await self._render_replay_games(chat_id, flow_id)
+        elif action == "level" and len(parts) == 4 and parts[3].isdigit():
+            levels = flow["catalog"][flow["game_index"]]["levels"]
+            index = int(parts[3])
+            if index >= len(levels):
+                return
+            flow["level_index"] = index
+            flow["selected"] = set()
+            flow.pop("members", None)
+            flow.pop("member_tokens", None)
+            flow["page"] = 0
+            await self._render_replay_targets(chat_id, flow_id)
+        elif action == "levels":
+            await self._render_replay_levels(chat_id, flow_id)
+        elif action == "toggle" and len(parts) == 4:
+            account_uuid = flow.get("member_tokens", {}).get(parts[3])
+            if account_uuid is None:
+                await self._render_replay_targets(chat_id, flow_id)
+                return
+            selected = flow.setdefault("selected", set())
+            selected.symmetric_difference_update({account_uuid})
+            await self._render_replay_targets(chat_id, flow_id)
+        elif action == "all":
+            flow.setdefault("selected", set()).update(
+                member["account_uuid"] for member in flow.get("members", [])
+            )
+            await self._render_replay_targets(chat_id, flow_id)
+        elif action == "none":
+            flow["selected"] = set()
+            await self._render_replay_targets(chat_id, flow_id)
+        elif action == "page" and len(parts) == 4 and parts[3].lstrip("-").isdigit():
+            flow["page"] = int(parts[3])
+            await self._render_replay_targets(chat_id, flow_id)
+        elif action == "confirm":
+            selected = list(flow.get("selected", set()))
+            game = flow["catalog"][flow["game_index"]]
+            level = game["levels"][flow["level_index"]]["level"]
+            try:
+                outcome = await asyncio.to_thread(
+                    self.pools.resend_level,
+                    flow["room"], game["contest"], level, selected, flow["owner"],
+                )
+                self.replay_flows.pop(flow_id, None)
+                text = (
+                    f"✅ Level {level} поставлен на повтор: {outcome['queued']} файлов "
+                    f"для {outcome['targets']} аккаунтов."
+                )
+                if outcome["already_active"]:
+                    text += f"\nУже в очереди или отправляются: {outcome['already_active']} файловых отправок."
+                text += "\nОтправки идут с обычными случайными задержками."
+                await self._send(chat_id, text, self._room_markup(flow["room"], True))
+            except (ValueError, sqlite3.Error) as error:
+                await self._send(chat_id, str(error)[:500], self._room_markup(flow["room"], True))
+
+    async def _handle_queueall_callback(self, callback, data: str):
+        callback_id = callback.get("id")
+        sender = callback.get("from") or {}
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        parts = data.split(":", 2)
+        if chat.get("type") != "private" or not isinstance(sender.get("id"), int):
+            await self._telegram(
+                "answerCallbackQuery", callback_query_id=callback_id,
+                text="Откройте меню в личном чате с ботом.", show_alert=True,
+            )
+            return
+        if len(parts) != 3:
+            return
+        _, action, room = parts
+        await self._telegram("answerCallbackQuery", callback_query_id=callback_id)
+        if action == "cancel":
+            await self._send(chat["id"], "Массовый запуск отменён.", self._room_markup(room, True))
+            return
+        if action != "confirm":
+            return
+        try:
+            count = await asyncio.to_thread(
+                self.pools.release_queued_batch, room, str(sender["id"])
+            )
+            await self._send(
+                chat["id"],
+                f"🚀 Запущено {count} ожидающих отправок. Между отправками сохраняются задержки.",
+                self._room_markup(room, True),
+            )
+        except (ValueError, sqlite3.Error) as error:
+            await self._send(chat["id"], str(error)[:500])
 
     async def _send_members(self, chat_id: int, room: str, user_id: str):
         members = await asyncio.to_thread(self.pools.members_snapshot, room, user_id)
