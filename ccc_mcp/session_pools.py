@@ -230,7 +230,7 @@ class SessionPools:
                     (telegram_user_id,),
                 )
                 return
-            if not self._can_manage_room(connection, room, telegram_user_id):
+            if not self._can_access_room(connection, room, telegram_user_id):
                 raise ValueError("Room not found or you are not a room member")
             connection.execute(
                 """INSERT INTO telegram_user_preferences
@@ -246,11 +246,18 @@ class SessionPools:
                 "SELECT active_room FROM telegram_user_preferences WHERE telegram_user_id = ?",
                 (telegram_user_id,),
             ).fetchone()
-            if not row or not self._can_manage_room(connection, row[0], telegram_user_id):
+            if not row or not self._can_access_room(connection, row[0], telegram_user_id):
                 return None
             return row[0]
 
-    def _can_manage_room(self, connection, room: str, telegram_user_id: str) -> bool:
+    def is_room_owner(self, room: str, telegram_user_id: str) -> bool:
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            return connection.execute(
+                "SELECT 1 FROM telegram_rooms WHERE name = ? AND owner_id = ?",
+                (room, telegram_user_id),
+            ).fetchone() is not None
+
+    def _can_access_room(self, connection, room: str, telegram_user_id: str) -> bool:
         return connection.execute(
             """SELECT 1 FROM telegram_rooms WHERE name = ? AND owner_id = ?
                UNION SELECT 1 FROM telegram_room_members
@@ -258,10 +265,16 @@ class SessionPools:
             (room, telegram_user_id, room, telegram_user_id),
         ).fetchone() is not None
 
+    def _can_manage_room(self, connection, room: str, telegram_user_id: str) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM telegram_rooms WHERE name = ? AND owner_id = ?",
+            (room, telegram_user_id),
+        ).fetchone() is not None
+
     def queue_snapshot(self, room: str, telegram_user_id: str):
         with sqlite3.connect(self.database, timeout=30) as connection:
             if not self._can_manage_room(connection, room, telegram_user_id):
-                raise ValueError("Room not found or you are not a room member")
+                raise ValueError("Only the room creator can manage its queue and history")
             rows = connection.execute(
                 """SELECT q.id, q.contest, q.level, q.file_id, q.target_uuid,
                           m.telegram_label, m.telegram_user_id,
@@ -298,7 +311,7 @@ class SessionPools:
                 (job_id,),
             ).fetchone()
             if not job or not self._can_manage_room(connection, job[0], telegram_user_id):
-                raise ValueError("Room not found or you are not a room member")
+                raise ValueError("Only the room creator can manage its queue")
             connection.execute(
                 "UPDATE telegram_fanout_queue SET run_after = ?, manual = 1 WHERE id = ?",
                 (time.time(), job_id),
@@ -308,7 +321,7 @@ class SessionPools:
     def history_snapshot(self, room: str, telegram_user_id: str, limit: int = 20):
         with sqlite3.connect(self.database, timeout=30) as connection:
             if not self._can_manage_room(connection, room, telegram_user_id):
-                raise ValueError("Room not found or you are not a room member")
+                raise ValueError("Only the room creator can manage its queue and history")
             rows = connection.execute(
                 """SELECT q.id, q.contest, q.level, q.file_id, q.target_uuid,
                           m.telegram_label, m.telegram_user_id, q.status, q.detail,

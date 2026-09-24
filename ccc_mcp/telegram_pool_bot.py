@@ -33,16 +33,9 @@ class TelegramPoolBot:
             "inline_keyboard": [
                 [
                     {"text": "🏠 Мои комнаты", "callback_data": "menu:rooms"},
-                    {"text": "⏳ Очередь", "callback_data": "menu:queue"},
-                ],
-                [
-                    {"text": "📤 История / повтор", "callback_data": "menu:history"},
                     {"text": "➕ Создать комнату", "callback_data": "menu:create"},
                 ],
-                [
-                    {"text": "🔗 Подключить аккаунт", "callback_data": "menu:connect"},
-                    {"text": "➖ Отключить аккаунт", "callback_data": "menu:disconnect"},
-                ],
+                [{"text": "🔗 Подключить аккаунт", "callback_data": "menu:connect"}],
                 [{"text": "ℹ️ Помощь", "callback_data": "menu:help"}],
             ]
         }
@@ -134,8 +127,8 @@ class TelegramPoolBot:
                 self.pools.set_active_room(parts[1], user)
                 await self._send(
                     chat_id,
-                    f"Комната {parts[1]} создана. Подключите CCC-аккаунт кнопкой «Подключить аккаунт».",
-                    self._room_markup(parts[1]),
+                    f"Комната {parts[1]} создана. Вы создатель и управляете очередью, историей и повторами. Подключите CCC-аккаунт кнопкой ниже.",
+                    self._room_markup(parts[1], True),
                 )
             elif command == "/connect" and len(parts) == 3:
                 if not self.settings.public_origin.startswith("https://"):
@@ -201,9 +194,10 @@ class TelegramPoolBot:
         return f"{math.ceil(remaining / 60)} мин"
 
     async def _send_queue(self, chat_id: int, room: str, user_id: str):
+        is_owner = await asyncio.to_thread(self.pools.is_room_owner, room, user_id)
         items = await asyncio.to_thread(self.pools.queue_snapshot, room, user_id)
         if not items:
-            await self._send(chat_id, f"Очередь комнаты {room} пуста.", self._room_markup(room))
+            await self._send(chat_id, f"Очередь комнаты {room} пуста.", self._room_markup(room, is_owner))
             return
         now = time.time()
         for start in range(0, len(items), 12):
@@ -225,7 +219,7 @@ class TelegramPoolBot:
             await self._send(
                 chat_id,
                 "\n".join(lines),
-                {"inline_keyboard": keyboard_rows + self._room_markup(room)["inline_keyboard"]},
+                {"inline_keyboard": keyboard_rows + self._room_markup(room, is_owner)["inline_keyboard"]},
             )
 
     async def _handle_callback(self, callback):
@@ -302,17 +296,11 @@ class TelegramPoolBot:
         elif action == "queue":
             room = await asyncio.to_thread(self.pools.active_room, user_id)
             if room:
-                await self._send_queue(chat["id"], room, user_id)
+                await self._send(chat["id"], "Откройте комнату через «Мои комнаты», чтобы перейти к её панели.")
             else:
-                await self._show_room_picker(chat["id"], user_id, action)
+                await self._send(chat["id"], "Сначала откройте комнату через «Мои комнаты».")
         elif action == "history":
-            room = await asyncio.to_thread(self.pools.active_room, user_id)
-            if room:
-                await self._send_history(chat["id"], room, user_id)
-            else:
-                await self._show_room_picker(chat["id"], user_id, action)
-        elif action == "disconnect":
-            await self._show_room_picker(chat["id"], user_id, action)
+            await self._send(chat["id"], "История и повторы находятся в панели создателя комнаты.")
         elif action in ("create", "connect"):
             self.pending_actions[user_id] = action
             prompt = (
@@ -334,7 +322,9 @@ class TelegramPoolBot:
                 await self._send(chat["id"], "Комната больше не доступна вашему аккаунту.")
                 return
             await asyncio.to_thread(self.pools.set_active_room, room, user_id)
-            await self._send(chat["id"], f"Комната {room}", self._room_markup(room))
+            is_owner = await asyncio.to_thread(self.pools.is_room_owner, room, user_id)
+            title = f"Комната {room} · панель создателя" if is_owner else f"Комната {room} · ваш аккаунт"
+            await self._send(chat["id"], title, self._room_markup(room, is_owner))
         elif action.startswith(("roomqueue:", "roomhistory:", "roomdisconnect:")):
             route, room = action.split(":", 1)
             rooms = await asyncio.to_thread(self.pools.rooms_for_user, user_id)
@@ -343,8 +333,14 @@ class TelegramPoolBot:
                 return
             await asyncio.to_thread(self.pools.set_active_room, room, user_id)
             if route == "roomqueue":
+                if not await asyncio.to_thread(self.pools.is_room_owner, room, user_id):
+                    await self._send(chat["id"], "Очередью и повторами управляет только создатель комнаты.")
+                    return
                 await self._send_queue(chat["id"], room, user_id)
             elif route == "roomhistory":
+                if not await asyncio.to_thread(self.pools.is_room_owner, room, user_id):
+                    await self._send(chat["id"], "Очередью и повторами управляет только создатель комнаты.")
+                    return
                 await self._send_history(chat["id"], room, user_id)
             else:
                 removed = await asyncio.to_thread(self.pools.remove_member, room, user_id)
@@ -356,16 +352,19 @@ class TelegramPoolBot:
                 )
 
     @staticmethod
-    def _room_markup(room: str):
-        return {
-            "inline_keyboard": [
+    def _room_markup(room: str, is_owner: bool):
+        keyboard = []
+        if is_owner:
+            keyboard.extend([
                 [
                     {"text": "⏳ Очередь", "callback_data": f"menu:roomqueue:{room}"},
                     {"text": "📤 История и повторы", "callback_data": f"menu:roomhistory:{room}"},
                 ],
-                [{"text": "➖ Отключить мой аккаунт", "callback_data": f"menu:roomdisconnect:{room}"}],
-                [{"text": "🔄 Сменить комнату", "callback_data": "menu:rooms"}],
-            ]
+            ])
+        keyboard.append([{"text": "➖ Отключить мой аккаунт", "callback_data": f"menu:roomdisconnect:{room}"}])
+        keyboard.append([{"text": "🔄 Сменить комнату", "callback_data": "menu:rooms"}])
+        return {
+            "inline_keyboard": keyboard
         }
 
     async def _show_room_picker(self, chat_id: int, user_id: str, action: str):
@@ -381,11 +380,12 @@ class TelegramPoolBot:
 
     async def _send_history(self, chat_id: int, room: str, user_id: str):
         items = await asyncio.to_thread(self.pools.history_snapshot, room, user_id)
+        is_owner = await asyncio.to_thread(self.pools.is_room_owner, room, user_id)
         if not items:
             await self._send(
                 chat_id,
                 f"В комнате {room} пока нет недавних отправок, для которых сохранён файл повтора.",
-                self._room_markup(room),
+                self._room_markup(room, is_owner),
             )
             return
         for start in range(0, len(items), 12):
@@ -411,7 +411,7 @@ class TelegramPoolBot:
             await self._send(
                 chat_id,
                 "\n".join(lines),
-                {"inline_keyboard": keyboard_rows + self._room_markup(room)["inline_keyboard"]},
+                {"inline_keyboard": keyboard_rows + self._room_markup(room, is_owner)["inline_keyboard"]},
             )
 
     async def _deliver_one(self):
