@@ -21,10 +21,12 @@ from .service import compact_progress, contest_slug, segment
 from .session_pools import SessionPools
 from .telegram_state import (
     claim_solution,
-    delete_solution_payloads,
+    get_progress_message,
     get_solution_batch,
     save_solution_batch,
+    save_progress_message,
     save_solution_payload,
+    solution_progress,
     solution_payloads,
     update_solution_status,
 )
@@ -240,14 +242,6 @@ async def _notify_telegram_solution(
                     database, slug, level, str(file_id), status
                 )
             )
-            if (
-                status in ("sent", "updated")
-                and expected_files
-                and set(expected_files).issubset(accepted_ids)
-            ):
-                await local(
-                    lambda: delete_solution_payloads(database, slug, level)
-                )
             return f"{status}: {detail}" if detail else status
         except (OSError, sqlite3.Error) as error:
             logger.warning(
@@ -262,6 +256,79 @@ async def _notify_telegram_solution(
             except (OSError, sqlite3.Error):
                 pass
             return "failed"
+
+
+async def update_telegram_progress(configured, reset: bool = False):
+    """Keep one Telegram message current with this deployment's solved levels."""
+    if not configured.bot_token or not configured.bot_chat_id:
+        return
+    database = configured.bot_dedupe_db or configured.data_dir / "telegram-sent.sqlite3"
+    progress_database = configured.data_dir / "telegram-progress.sqlite3"
+    try:
+        current = await local(lambda: get_progress_message(progress_database))
+        if reset:
+            text = "🔄 Новый деплой. Прогресс и сохранённые ответы сброшены. Решённых уровней пока нет."
+        else:
+            levels = await local(lambda: solution_progress(database))
+            lines = ["📊 Решения в текущем запуске:"]
+            for item in levels:
+                count = (
+                    f"{item['accepted']}/{item['expected']} файлов"
+                    if item["expected"]
+                    else f"{item['accepted']} файлов"
+                )
+                mark = "✅" if item["complete"] else "⏳"
+                lines.append(
+                    f"{mark} {item['contest']} · Level {item['level']} · {count}"
+                )
+            if not levels:
+                lines.append("Решённых уровней пока нет.")
+            text = "\n".join(lines)
+
+        async with httpx.AsyncClient(timeout=min(configured.timeout, 15)) as client:
+            if current and current["chat_id"] == str(configured.bot_chat_id):
+                response = await client.post(
+                    f"https://api.telegram.org/bot{configured.bot_token}/editMessageText",
+                    json={
+                        "chat_id": configured.bot_chat_id,
+                        "message_id": current["message_id"],
+                        "text": text,
+                    },
+                )
+                body = response.json()
+                if response.is_success and isinstance(body, dict) and body.get("ok") is True:
+                    return
+                description = body.get("description") if isinstance(body, dict) else None
+                if description == "Bad Request: message is not modified":
+                    return
+                logger.info(
+                    "Telegram progress message edit failed (HTTP %s): %s; sending a replacement",
+                    response.status_code,
+                    description if isinstance(description, str) else "unknown error",
+                )
+
+            response = await client.post(
+                f"https://api.telegram.org/bot{configured.bot_token}/sendMessage",
+                json={"chat_id": configured.bot_chat_id, "text": text},
+            )
+        body = response.json()
+        result_body = body.get("result") if isinstance(body, dict) else None
+        message_id = result_body.get("message_id") if isinstance(result_body, dict) else None
+        if response.is_success and isinstance(body, dict) and body.get("ok") is True and isinstance(message_id, int):
+            await local(
+                lambda: save_progress_message(
+                    progress_database, str(configured.bot_chat_id), message_id
+                )
+            )
+        else:
+            description = body.get("description") if isinstance(body, dict) else None
+            logger.warning(
+                "Telegram progress message failed (HTTP %s): %s",
+                response.status_code,
+                description if isinstance(description, str) else "unknown error",
+            )
+    except (httpx.HTTPError, OSError, sqlite3.Error, ValueError) as error:
+        logger.warning("Could not update Telegram progress message (%s)", type(error).__name__)
 
 
 @tool(read_only=False)
@@ -492,6 +559,7 @@ async def submit_solution(
             notification_status = await _notify_telegram_solution(
                 service, contest, level, file_id, filename, payload
             )
+            await update_telegram_progress(service.client.settings)
             if isinstance(feedback, dict):
                 feedback["telegram_notification"] = notification_status
             team_room = current_team_room()

@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import re
+import socket
 import sqlite3
 import tempfile
 import traceback
@@ -24,6 +25,7 @@ from .service import Service
 from .sessions import AccountSessions
 from .session_pools import SessionPools
 from .telegram_pool_bot import TelegramPoolBot
+from .telegram_state import clear_solution_state
 from .tools import create_mcp, settings
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,7 @@ class AccountMiddleware:
 
             async def send_with_startup_notice(message):
                 if message["type"] == "lifespan.startup.complete":
+                    await self.reset_progress_after_redeploy()
                     if self.settings.bot_token:
                         self.telegram_task = asyncio.create_task(
                             TelegramPoolBot(self.settings, self.session_pools).run()
@@ -355,6 +358,87 @@ class AccountMiddleware:
                 detail[:1000],
                 "".join(traceback.format_tb(error.__traceback__)),
             )
+
+    async def reset_progress_after_redeploy(self):
+        instance_id = (
+            os.getenv("MCP_DEPLOYMENT_ID")
+            or os.getenv("HOSTNAME")
+            or socket.gethostname()
+        )
+        changed = await asyncio.to_thread(
+            self.session_pools.deployment_instance_changed, instance_id
+        )
+        if not changed:
+            return
+
+        solution_db = (
+            self.settings.bot_dedupe_db
+            or self.settings.data_dir / "telegram-sent.sqlite3"
+        )
+        message_ids = await asyncio.to_thread(clear_solution_state, solution_db)
+        cleared_queue = await asyncio.to_thread(
+            self.session_pools.clear_solution_queue
+        )
+
+        removed_artifacts = 0
+        for path in self.settings.data_dir.iterdir():
+            if (
+                re.fullmatch(r"[a-f0-9]{32}", path.name)
+                and path.is_file()
+                and not path.is_symlink()
+            ):
+                path.unlink(missing_ok=True)
+                removed_artifacts += 1
+
+        if message_ids and self.settings.bot_token and self.settings.bot_chat_id:
+            async with httpx.AsyncClient(timeout=min(self.settings.timeout, 15)) as client:
+                for message_id in message_ids:
+                    try:
+                        response = await client.post(
+                            f"https://api.telegram.org/bot{self.settings.bot_token}/deleteMessage",
+                            json={
+                                "chat_id": self.settings.bot_chat_id,
+                                "message_id": message_id,
+                            },
+                        )
+                        body = response.json()
+                        if not (
+                            response.is_success
+                            and isinstance(body, dict)
+                            and body.get("ok") is True
+                        ):
+                            description = (
+                                body.get("description")
+                                if isinstance(body, dict)
+                                else None
+                            )
+                            logger.warning(
+                                "Could not remove old Telegram solution message id=%s (HTTP %s): %s",
+                                message_id,
+                                response.status_code,
+                                description if isinstance(description, str) else "unknown error",
+                            )
+                    except (httpx.HTTPError, ValueError) as error:
+                        logger.warning(
+                            "Could not remove old Telegram solution message id=%s (%s)",
+                            message_id,
+                            type(error).__name__,
+                        )
+        elif message_ids:
+            logger.warning(
+                "Skipped deletion of %s old Telegram solution messages: BOT_TOKEN or BOT_CHAT_ID is missing",
+                len(message_ids),
+            )
+
+        await game_tools.update_telegram_progress(self.settings, reset=True)
+        await asyncio.to_thread(
+            self.session_pools.record_deployment_instance, instance_id
+        )
+        logger.info(
+            "New deployment detected; cleared solution progress, %s fanout queue/history entries, %s Telegram message references and %s local artifacts; room/session database preserved at %s",
+            cleared_queue, len(message_ids), removed_artifacts,
+            self.settings.data_dir / "telegram-pools.sqlite3",
+        )
 
     async def enroll_telegram_session(self, scope, receive, send, token):
         headers = {key.lower(): value for key, value in scope.get("headers", [])}

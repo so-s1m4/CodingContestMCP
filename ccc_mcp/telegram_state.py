@@ -140,38 +140,6 @@ def solution_payloads(database: Path, contest: str, level: int):
         ]
 
 
-def delete_solution_payloads(database: Path, contest: str, level: int):
-    with sqlite3.connect(database, timeout=30) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS telegram_solution_payloads (
-                contest TEXT NOT NULL,
-                level INTEGER NOT NULL,
-                file_id TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                path TEXT NOT NULL,
-                PRIMARY KEY (contest, level, file_id)
-            )
-            """
-        )
-        rows = connection.execute(
-            """
-            SELECT path FROM telegram_solution_payloads
-            WHERE contest = ? AND level = ?
-            """,
-            (contest, level),
-        ).fetchall()
-        connection.execute(
-            "DELETE FROM telegram_solution_payloads WHERE contest = ? AND level = ?",
-            (contest, level),
-        )
-    for (path,) in rows:
-        try:
-            Path(path).unlink()
-        except FileNotFoundError:
-            pass
-
-
 def get_solution_batch(database: Path, contest: str, level: int):
     with sqlite3.connect(database, timeout=30) as connection:
         connection.execute(
@@ -203,6 +171,141 @@ def get_solution_batch(database: Path, contest: str, level: int):
         "message_id": row[0],
         "expected_files": expected if isinstance(expected, list) else [],
     }
+
+
+def clear_solution_state(database: Path):
+    """Remove accepted-answer state while leaving the room/session database untouched."""
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(database, timeout=30) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_solutions (
+                contest TEXT NOT NULL, level INTEGER NOT NULL, file_id TEXT NOT NULL,
+                status TEXT NOT NULL, PRIMARY KEY (contest, level, file_id)
+            );
+            CREATE TABLE IF NOT EXISTS telegram_solution_payloads (
+                contest TEXT NOT NULL, level INTEGER NOT NULL, file_id TEXT NOT NULL,
+                filename TEXT NOT NULL, path TEXT NOT NULL,
+                PRIMARY KEY (contest, level, file_id)
+            );
+            CREATE TABLE IF NOT EXISTS telegram_solution_batches (
+                contest TEXT NOT NULL, level INTEGER NOT NULL, message_id INTEGER,
+                expected_files TEXT, PRIMARY KEY (contest, level)
+            );
+            """
+        )
+        message_ids = [
+            row[0]
+            for row in connection.execute(
+                "SELECT message_id FROM telegram_solution_batches WHERE message_id IS NOT NULL"
+            ).fetchall()
+        ]
+        paths = [
+            Path(row[0])
+            for row in connection.execute(
+                "SELECT path FROM telegram_solution_payloads"
+            ).fetchall()
+        ]
+        connection.execute("DELETE FROM telegram_solutions")
+        connection.execute("DELETE FROM telegram_solution_payloads")
+        connection.execute("DELETE FROM telegram_solution_batches")
+
+    solution_dir = database.parent / "telegram-solutions"
+    for path in paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    if solution_dir.is_dir() and not solution_dir.is_symlink():
+        for path in solution_dir.iterdir():
+            if path.is_file() or path.is_symlink():
+                path.unlink(missing_ok=True)
+        try:
+            solution_dir.rmdir()
+        except OSError:
+            pass
+    return message_ids
+
+
+def solution_progress(database: Path):
+    """Summarize currently retained accepted outputs for the Telegram status message."""
+    with sqlite3.connect(database, timeout=30) as connection:
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS telegram_solution_payloads (
+                   contest TEXT NOT NULL, level INTEGER NOT NULL, file_id TEXT NOT NULL,
+                   filename TEXT NOT NULL, path TEXT NOT NULL,
+                   PRIMARY KEY (contest, level, file_id)
+               )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS telegram_solution_batches (
+                   contest TEXT NOT NULL, level INTEGER NOT NULL, message_id INTEGER,
+                   expected_files TEXT, PRIMARY KEY (contest, level)
+               )"""
+        )
+        rows = connection.execute(
+            """SELECT contest, level, file_id FROM telegram_solution_payloads
+               ORDER BY contest, level, file_id"""
+        ).fetchall()
+        expected_rows = connection.execute(
+            "SELECT contest, level, expected_files FROM telegram_solution_batches"
+        ).fetchall()
+    accepted = {}
+    for contest, level, file_id in rows:
+        accepted.setdefault((contest, level), set()).add(file_id)
+    expected = {}
+    for contest, level, raw in expected_rows:
+        try:
+            values = json.loads(raw) if raw else []
+        except (TypeError, ValueError):
+            values = []
+        if isinstance(values, list):
+            expected[(contest, level)] = {
+                str(value) for value in values if isinstance(value, (str, int))
+            }
+    keys = sorted(set(accepted) | set(expected))
+    return [
+        {
+            "contest": contest,
+            "level": level,
+            "accepted": len(accepted.get((contest, level), set())),
+            "expected": len(expected.get((contest, level), set())),
+            "complete": bool(expected.get((contest, level)))
+            and expected[(contest, level)].issubset(accepted.get((contest, level), set())),
+        }
+        for contest, level in keys
+    ]
+
+
+def get_progress_message(database: Path):
+    with sqlite3.connect(database, timeout=30) as connection:
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS telegram_progress_message (
+                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                   chat_id TEXT NOT NULL, message_id INTEGER NOT NULL
+               )"""
+        )
+        row = connection.execute(
+            "SELECT chat_id, message_id FROM telegram_progress_message WHERE singleton = 1"
+        ).fetchone()
+    return {"chat_id": row[0], "message_id": row[1]} if row else None
+
+
+def save_progress_message(database: Path, chat_id: str, message_id: int):
+    with sqlite3.connect(database, timeout=30) as connection:
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS telegram_progress_message (
+                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                   chat_id TEXT NOT NULL, message_id INTEGER NOT NULL
+               )"""
+        )
+        connection.execute(
+            """INSERT INTO telegram_progress_message (singleton, chat_id, message_id)
+               VALUES (1, ?, ?)
+               ON CONFLICT(singleton) DO UPDATE SET
+                   chat_id = excluded.chat_id, message_id = excluded.message_id""",
+            (chat_id, message_id),
+        )
 
 
 def save_solution_batch(

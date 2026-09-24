@@ -111,6 +111,39 @@ class SessionPools:
             )
         self.recover_stale_jobs()
 
+    def deployment_instance_changed(self, instance_id: str) -> bool:
+        """Check the container identity without mixing it with room/session state."""
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS app_runtime_state (
+                       key TEXT PRIMARY KEY,
+                       value TEXT NOT NULL
+                   )"""
+            )
+            row = connection.execute(
+                "SELECT value FROM app_runtime_state WHERE key = 'instance_id'"
+            ).fetchone()
+            return row is None or row[0] != instance_id
+
+    def record_deployment_instance(self, instance_id: str) -> None:
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.execute(
+                """INSERT INTO app_runtime_state (key, value)
+                   VALUES ('instance_id', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (instance_id,),
+            )
+
+    def clear_solution_queue(self) -> int:
+        """Discard answer submissions/history while keeping room members and sessions."""
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM telegram_fanout_queue"
+            ).fetchone()[0]
+            connection.execute("DELETE FROM telegram_fanout_queue")
+            connection.execute("DELETE FROM telegram_target_cooldowns")
+        return count
+
     def recover_stale_jobs(self, stale_after: int = 600):
         """Requeue claims abandoned by a killed worker after a safety timeout."""
         now = time.time()
