@@ -257,6 +257,17 @@ class SessionPools:
                 ).fetchall()
             ]
 
+    def rooms_for_account(self, account_uuid: str):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            return [
+                row[0]
+                for row in connection.execute(
+                    """SELECT DISTINCT room FROM telegram_room_members
+                       WHERE account_uuid = ? ORDER BY room""",
+                    (account_uuid,),
+                ).fetchall()
+            ]
+
     def members_snapshot(self, room: str, telegram_user_id: str):
         with sqlite3.connect(self.database, timeout=30) as connection:
             if not self._can_manage_room(connection, room, telegram_user_id):

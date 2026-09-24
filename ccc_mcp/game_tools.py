@@ -62,7 +62,13 @@ async def _notify_telegram_solution(
                 )
             )
             batch = await local(lambda: get_solution_batch(database, slug, level))
-            expected_files = batch["expected_files"]
+            expected_files = list(
+                dict.fromkeys(
+                    str(item)
+                    for item in batch["expected_files"]
+                    if isinstance(item, (str, int))
+                )
+            )
             if not expected_files:
                 try:
                     info = await service.info(contest)
@@ -79,6 +85,7 @@ async def _notify_telegram_solution(
                         for item in level_info.get("inputFiles", [])
                         if isinstance(item, (str, int))
                     ]
+                    expected_files = list(dict.fromkeys(expected_files))
                 except Exception as error:
                     logger.info(
                         "Could not load expected Telegram batch files: %s",
@@ -92,6 +99,14 @@ async def _notify_telegram_solution(
             if expected_files:
                 passed = len(accepted_ids.intersection(expected_files))
                 progress = f"{passed}/{len(expected_files)} files passed"
+                missing_expected = [
+                    item for item in expected_files if item not in accepted_ids
+                ]
+                if missing_expected:
+                    logger.info(
+                        "Telegram solution bundle incomplete contest=%s level=%s accepted=%s expected=%s missing_file_ids=%s",
+                        slug, level, passed, len(expected_files), missing_expected,
+                    )
             else:
                 progress = f"{len(entries)} files passed"
             caption = (
@@ -458,7 +473,7 @@ async def submit_solution(
     Returns evaluation, score and cooldownSec.
     Failed-case previews are bounded and use zero-based case_index; full_result preserves the complete report.
     No automatic retries or file-ID guessing. Check evaluation.isCorrect, not only ok.
-    Optional X-CCC-Team-Room request header queues an accepted solution to other linked accounts in that room."""
+    Accepted solutions are queued for other accounts in X-CCC-Team-Room. If the submitting account is linked to exactly one room, that room is selected automatically; set the header when it belongs to multiple rooms."""
 
     async def run():
         if (solution is None) == (artifact_id is None):
@@ -480,21 +495,49 @@ async def submit_solution(
             if isinstance(feedback, dict):
                 feedback["telegram_notification"] = notification_status
             team_room = current_team_room()
-            if team_room:
-                source_suffix = "unknown"
-                try:
-                    account = await service.client.json(
-                        "GET", "/api/auth/current-user"
+            source_suffix = "unknown"
+            try:
+                account = await service.client.json(
+                    "GET", "/api/auth/current-user"
+                )
+                account_uuid = account.get("uuid") if isinstance(account, dict) else None
+                if not isinstance(account_uuid, str) or not account_uuid:
+                    raise ValueError("Could not verify the submitting CCC account")
+                source_suffix = account_uuid[-6:]
+                pools = SessionPools(
+                    service.client.settings.data_dir / "telegram-pools.sqlite3",
+                    service.client.settings.bot_session_encryption_key,
+                )
+                if not team_room:
+                    linked_rooms = await local(
+                        lambda: pools.rooms_for_account(account_uuid)
                     )
-                    account_uuid = account.get("uuid") if isinstance(account, dict) else None
-                    if not isinstance(account_uuid, str) or not account_uuid:
-                        raise ValueError("Could not verify the submitting CCC account")
-                    source_suffix = account_uuid[-6:]
-                    pools = SessionPools(
-                        service.client.settings.data_dir.parent.parent
-                        / "telegram-pools.sqlite3",
-                        service.client.settings.bot_session_encryption_key,
-                    )
+                    if len(linked_rooms) == 1:
+                        team_room = linked_rooms[0]
+                        logger.info(
+                            "Auto-selected the only linked Telegram room room=%s source=CCC…%s",
+                            team_room, source_suffix,
+                        )
+                    elif len(linked_rooms) > 1:
+                        fanout_status = (
+                            "skipped: CCC account belongs to multiple rooms; "
+                            "set X-CCC-Team-Room to choose one"
+                        )
+                        logger.warning(
+                            "Accepted solution not fanned out: multiple linked rooms and no X-CCC-Team-Room header source=CCC…%s rooms=%s contest=%s level=%s file_id=%s",
+                            source_suffix, linked_rooms, contest_slug(contest),
+                            level, file_id,
+                        )
+                    else:
+                        fanout_status = (
+                            "skipped: CCC account is not linked to a room; connect it "
+                            "or set X-CCC-Team-Room"
+                        )
+                        logger.info(
+                            "Accepted solution not fanned out: no X-CCC-Team-Room and no linked rooms source=CCC…%s contest=%s level=%s file_id=%s",
+                            source_suffix, contest_slug(contest), level, file_id,
+                        )
+                if team_room:
                     fanout = await local(
                         lambda: pools.enqueue_fanout(
                             team_room,
@@ -527,30 +570,27 @@ async def submit_solution(
                             team_room, contest_slug(contest), level, file_id,
                             source_suffix, fanout["targets"],
                         )
-                except (OSError, ValueError, sqlite3.Error) as error:
-                    fanout_status = f"failed: {str(error)[:200]}"
-                    detail = str(error)
-                    for secret in (
-                        service.client.settings.session,
-                        service.client.settings.bot_token,
-                        service.client.settings.bot_session_encryption_key,
-                    ):
-                        if secret:
-                            detail = detail.replace(secret, "[redacted]")
-                    logger.error(
-                        "Accepted solution fanout failed room=%s contest=%s level=%s file_id=%s source=CCC…%s (%s): %s\n%s",
-                        team_room, contest_slug(contest), level, file_id,
-                        source_suffix, type(error).__name__, detail[:1000],
-                        "".join(traceback.format_tb(error.__traceback__)),
-                    )
+            except Exception as error:
+                fanout_status = f"failed: {type(error).__name__}"
+                detail = str(error)
+                for secret in (
+                    service.client.settings.session,
+                    service.client.settings.bot_token,
+                    service.client.settings.bot_session_encryption_key,
+                ):
+                    if secret:
+                        detail = detail.replace(secret, "[redacted]")
+                logger.error(
+                    "Accepted solution fanout failed room=%s contest=%s level=%s file_id=%s source=CCC…%s (%s): %s\n%s",
+                    team_room or "unselected", contest_slug(contest), level, file_id,
+                    source_suffix, type(error).__name__, detail[:1000],
+                    "".join(traceback.format_tb(error.__traceback__)),
+                )
                 if isinstance(feedback, dict):
                     feedback["team_fanout"] = fanout_status
-            elif isinstance(feedback, dict):
-                feedback["team_fanout"] = "skipped: X-CCC-Team-Room header is missing"
-                logger.info(
-                    "Accepted solution not fanned out: X-CCC-Team-Room missing contest=%s level=%s file_id=%s",
-                    contest_slug(contest), level, file_id,
-                )
+            else:
+                if isinstance(feedback, dict):
+                    feedback["team_fanout"] = fanout_status
         elif current_team_room():
             logger.info(
                 "Room fanout skipped because CCC did not accept solution room=%s contest=%s level=%s file_id=%s is_correct=%s",
