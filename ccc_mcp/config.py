@@ -42,7 +42,11 @@ class Settings:
     @classmethod
     def from_env(cls):
         load_dotenv(override=False)
-        data_dir = Path(os.getenv("CCC_DATA_DIR", "./data")).resolve()
+        configured_data_dir = os.getenv("CCC_DATA_DIR", "/app/data")
+        # Keep deployments that still define the old container path working.
+        if configured_data_dir == "/data":
+            configured_data_dir = "/app/data"
+        data_dir = Path(configured_data_dir).resolve()
         dedupe_db = os.getenv("BOT_DEDUPE_DB")
         return cls(
             data_dir=data_dir,
