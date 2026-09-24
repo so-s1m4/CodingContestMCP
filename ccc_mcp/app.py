@@ -5,7 +5,6 @@ import hashlib
 import logging
 import os
 import re
-import socket
 import sqlite3
 import tempfile
 import traceback
@@ -61,7 +60,7 @@ class AccountMiddleware:
 
             async def send_with_startup_notice(message):
                 if message["type"] == "lifespan.startup.complete":
-                    await self.reset_progress_after_redeploy()
+                    await self.reset_progress_on_startup()
                     if self.settings.bot_token:
                         self.telegram_task = asyncio.create_task(
                             TelegramPoolBot(self.settings, self.session_pools).run()
@@ -365,18 +364,7 @@ class AccountMiddleware:
                 "".join(traceback.format_tb(error.__traceback__)),
             )
 
-    async def reset_progress_after_redeploy(self):
-        instance_id = (
-            os.getenv("MCP_DEPLOYMENT_ID")
-            or os.getenv("HOSTNAME")
-            or socket.gethostname()
-        )
-        changed = await asyncio.to_thread(
-            self.session_pools.deployment_instance_changed, instance_id
-        )
-        if not changed:
-            return
-
+    async def reset_progress_on_startup(self):
         solution_db = (
             self.settings.bot_dedupe_db
             or self.settings.data_dir / "telegram-sent.sqlite3"
@@ -387,7 +375,7 @@ class AccountMiddleware:
         )
 
         removed_artifacts = 0
-        for path in self.settings.data_dir.iterdir():
+        for path in self.settings.data_dir.rglob("*"):
             if (
                 re.fullmatch(r"[a-f0-9]{32}", path.name)
                 and path.is_file()
@@ -437,11 +425,8 @@ class AccountMiddleware:
             )
 
         await game_tools.update_telegram_progress(self.settings, reset=True)
-        await asyncio.to_thread(
-            self.session_pools.record_deployment_instance, instance_id
-        )
         logger.info(
-            "New deployment detected; cleared solution progress, %s fanout queue/history entries, %s Telegram message references and %s local artifacts; room/session database preserved at %s",
+            "MCP startup reset; cleared solution progress, %s fanout queue/history entries, %s Telegram message references and %s local artifacts; room/session database preserved at %s",
             cleared_queue, len(message_ids), removed_artifacts,
             self.settings.data_dir / "telegram-pools.sqlite3",
         )

@@ -266,7 +266,7 @@ async def update_telegram_progress(configured, reset: bool = False):
     try:
         current = await local(lambda: get_progress_message(progress_database))
         if reset:
-            text = "🔄 Новый деплой. Прогресс и сохранённые ответы сброшены. Решённых уровней пока нет."
+            text = "🔄 Новый запуск MCP. Прогресс и сохранённые ответы сброшены. Решённых уровней пока нет."
         else:
             levels = await local(lambda: solution_progress(database))
             lines = ["📊 Решения в текущем запуске:"]
