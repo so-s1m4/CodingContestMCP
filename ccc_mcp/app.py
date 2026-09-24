@@ -405,7 +405,7 @@ class AccountMiddleware:
                 status_code=410,
                 headers={"Cache-Control": "no-store"},
             )(scope, receive, send)
-        room, telegram_user_id = pending
+        room, telegram_user_id, telegram_label = pending
         client = self.client_factory(
             replace(self.settings, cookie="", session=session)
         )
@@ -419,7 +419,7 @@ class AccountMiddleware:
                 )(scope, receive, send)
             await asyncio.to_thread(
                 self.session_pools.save_member,
-                room, telegram_user_id, account_uuid, session,
+                room, telegram_user_id, account_uuid, session, telegram_label,
             )
             if self.settings.bot_token:
                 try:

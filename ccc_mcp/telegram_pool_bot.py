@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import sqlite3
+import time
 from dataclasses import replace
 
 import httpx
@@ -33,15 +35,18 @@ class TelegramPoolBot:
                 raise ValueError("Telegram Bot API rejected the request")
             return body.get("result")
 
-    async def _send(self, chat_id: int, text: str):
-        await self._telegram("sendMessage", chat_id=chat_id, text=text)
+    async def _send(self, chat_id: int, text: str, reply_markup=None):
+        args = {"chat_id": chat_id, "text": text}
+        if reply_markup:
+            args["reply_markup"] = reply_markup
+        await self._telegram("sendMessage", **args)
 
     async def _poll_loop(self):
         while True:
             try:
                 updates = await self._telegram(
                     "getUpdates", offset=self.offset, timeout=25,
-                    allowed_updates=["message"],
+                    allowed_updates=["message", "callback_query"],
                 )
                 for update in updates or []:
                     self.offset = int(update.get("update_id", 0)) + 1
@@ -53,6 +58,10 @@ class TelegramPoolBot:
                 await asyncio.sleep(5)
 
     async def _handle_update(self, update):
+        callback = update.get("callback_query")
+        if isinstance(callback, dict):
+            await self._handle_callback(callback)
+            return
         message = update.get("message")
         if not isinstance(message, dict):
             return
@@ -84,7 +93,9 @@ class TelegramPoolBot:
                     "/create_room <комната> <пароль> — создать комнату\n"
                     "/connect <комната> <пароль> — подключить CCC-аккаунт через одноразовую HTTPS-форму\n"
                     "/disconnect <комната> — удалить свою сессию из комнаты\n"
-                    "/rooms — показать подключённые комнаты",
+                    "/rooms — показать ваши комнаты\n"
+                    "/queue <комната> — показать ожидающие аккаунты и сроки\n"
+                    "/send_now <ID> — запустить одну выбранную отправку",
                 )
             elif command == "/create_room" and len(parts) == 3:
                 self.pools.create_room(parts[1], parts[2], user)
@@ -92,7 +103,17 @@ class TelegramPoolBot:
             elif command == "/connect" and len(parts) == 3:
                 if not self.settings.public_origin.startswith("https://"):
                     raise ValueError("Для подключения сессий нужен HTTPS в MCP_PUBLIC_ORIGIN")
-                token = self.pools.create_enrollment_link(parts[1], parts[2], user)
+                user_label = sender.get("username")
+                if user_label:
+                    user_label = "@" + user_label
+                else:
+                    user_label = " ".join(
+                        part for part in (sender.get("first_name"), sender.get("last_name"))
+                        if isinstance(part, str) and part
+                    ) or user
+                token = self.pools.create_enrollment_link(
+                    parts[1], parts[2], user, user_label[:80]
+                )
                 url = f"{self.settings.public_origin}/telegram/session/{token}"
                 await self._send(
                     chat_id,
@@ -105,6 +126,16 @@ class TelegramPoolBot:
             elif command == "/rooms" and len(parts) == 1:
                 rooms = self.pools.rooms_for_user(user)
                 await self._send(chat_id, "Комнаты: " + (", ".join(rooms) if rooms else "нет подключённых комнат"))
+            elif command == "/queue" and len(parts) == 2:
+                await self._send_queue(chat_id, parts[1], user)
+            elif command == "/send_now" and len(parts) == 2 and parts[1].isdigit():
+                await asyncio.to_thread(
+                    self.pools.release_job_now, int(parts[1]), user
+                )
+                await self._send(
+                    chat_id,
+                    f"Отправка #{parts[1]} для выбранного аккаунта поставлена на ближайшее время.",
+                )
             else:
                 await self._send(chat_id, "Неизвестная команда или неверный формат. Отправьте /help.")
         except (ValueError, sqlite3.Error) as error:
@@ -112,6 +143,79 @@ class TelegramPoolBot:
         except Exception as error:
             logger.warning("Telegram pool command failed: %s", type(error).__name__)
             await self._send(chat_id, "Не удалось выполнить команду. Проверьте комнату и пароль.")
+
+    @staticmethod
+    def _eta(seconds: float) -> str:
+        remaining = max(0, math.ceil(seconds))
+        if remaining == 0:
+            return "сейчас"
+        if remaining < 60:
+            return f"{remaining} сек"
+        return f"{math.ceil(remaining / 60)} мин"
+
+    async def _send_queue(self, chat_id: int, room: str, user_id: str):
+        items = await asyncio.to_thread(self.pools.queue_snapshot, room, user_id)
+        if not items:
+            await self._send(chat_id, f"Очередь комнаты {room} пуста.")
+            return
+        now = time.time()
+        for start in range(0, len(items), 12):
+            chunk = items[start : start + 12]
+            lines = [f"Ожидающие отправки в комнате {room} ({start + 1}–{start + len(chunk)} из {len(items)}):"]
+            keyboard_rows = []
+            for item in chunk:
+                label = item["telegram_label"] or item["telegram_user_id"]
+                account_suffix = item["target_uuid"][-6:]
+                eta = self._eta(item["due_at"] - now)
+                lines.append(
+                    f"• #{item['job_id']} · {label} · CCC…{account_suffix}\n"
+                    f"  {item['contest']} · уровень {item['level']} · файл {item['file_id']} — через {eta}"
+                )
+                button_label = f"Отправить #{item['job_id']} для {label}"
+                keyboard_rows.append(
+                    [{"text": button_label[:60], "callback_data": f"sendnow:{item['job_id']}"}]
+                )
+            await self._send(
+                chat_id,
+                "\n".join(lines),
+                {"inline_keyboard": keyboard_rows},
+            )
+
+    async def _handle_callback(self, callback):
+        callback_id = callback.get("id")
+        sender = callback.get("from") or {}
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        data = callback.get("data", "")
+        if chat.get("type") != "private" or not isinstance(sender.get("id"), int):
+            if isinstance(callback_id, str):
+                await self._telegram(
+                    "answerCallbackQuery", callback_query_id=callback_id,
+                    text="Откройте бота в личном чате.", show_alert=True,
+                )
+            return
+        if not isinstance(data, str) or not data.startswith("sendnow:"):
+            return
+        raw_job_id = data.removeprefix("sendnow:")
+        if not raw_job_id.isdigit():
+            return
+        try:
+            await asyncio.to_thread(
+                self.pools.release_job_now, int(raw_job_id), str(sender["id"])
+            )
+            await self._telegram(
+                "answerCallbackQuery", callback_query_id=callback_id,
+                text="Отправка для этого аккаунта запущена.",
+            )
+            await self._send(
+                chat["id"],
+                f"Отправка #{raw_job_id} для выбранного аккаунта поставлена на ближайшее время.",
+            )
+        except (ValueError, sqlite3.Error) as error:
+            await self._telegram(
+                "answerCallbackQuery", callback_query_id=callback_id,
+                text=str(error)[:180], show_alert=True,
+            )
 
     async def _deliver_one(self):
         job = await asyncio.to_thread(self.pools.claim_due)
