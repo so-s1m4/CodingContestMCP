@@ -36,6 +36,7 @@ class TelegramPoolBot:
         self.base = f"https://api.telegram.org/bot{settings.bot_token}"
         self.offset = 0
         self.pending_actions = {}
+        self.callback_source_message_id = None
 
     async def _recipient_contest(self, client: CCCClient, job) -> str:
         game_slug = job.get("game_slug")
@@ -122,15 +123,59 @@ class TelegramPoolBot:
                 raise ValueError("Telegram Bot API rejected the request")
             return body.get("result")
 
-    async def _send(self, chat_id: int, text: str, reply_markup=None):
+    async def _send(
+        self, chat_id: int, text: str, reply_markup=None, replace_previous=True
+    ):
         if reply_markup is None:
             reply_markup = self._menu_markup()
         elif isinstance(reply_markup, dict) and isinstance(reply_markup.get("inline_keyboard"), list):
             reply_markup["inline_keyboard"].append(
                 [{"text": "🏠 Главное меню", "callback_data": "menu:home"}]
             )
+        chat_key = str(chat_id)
+        if replace_previous:
+            old_ids = await asyncio.to_thread(
+                self.pools.tracked_ui_messages, chat_key
+            )
+            if (
+                isinstance(self.callback_source_message_id, int)
+                and self.callback_source_message_id not in old_ids
+            ):
+                old_ids.append(self.callback_source_message_id)
+            self.callback_source_message_id = None
+            for old_id in old_ids:
+                try:
+                    await self._telegram(
+                        "deleteMessage", chat_id=chat_id, message_id=old_id
+                    )
+                except (httpx.HTTPError, ValueError) as error:
+                    response = getattr(error, "response", None)
+                    body = None
+                    if response is not None:
+                        try:
+                            body = response.json()
+                        except ValueError:
+                            pass
+                    description = body.get("description") if isinstance(body, dict) else ""
+                    if "message to delete not found" in str(description).casefold():
+                        await asyncio.to_thread(
+                            self.pools.forget_ui_message, chat_key, old_id
+                        )
+                    else:
+                        logger.warning(
+                            "Previous Telegram control message could not be deleted chat=%s message_id=%s (%s)",
+                            chat_id, old_id, type(error).__name__,
+                        )
+                else:
+                    await asyncio.to_thread(
+                        self.pools.forget_ui_message, chat_key, old_id
+                    )
         args = {"chat_id": chat_id, "text": text, "reply_markup": reply_markup}
-        await self._telegram("sendMessage", **args)
+        sent = await self._telegram("sendMessage", **args)
+        if isinstance(sent, dict) and isinstance(sent.get("message_id"), int):
+            await asyncio.to_thread(
+                self.pools.track_ui_message, chat_key, sent["message_id"]
+            )
 
     async def _poll_loop(self):
         while True:
@@ -154,6 +199,7 @@ class TelegramPoolBot:
                 await asyncio.sleep(5)
 
     async def _handle_update(self, update):
+        self.callback_source_message_id = None
         callback = update.get("callback_query")
         if isinstance(callback, dict):
             await self._handle_callback(callback)
@@ -322,6 +368,7 @@ class TelegramPoolBot:
                 chat_id,
                 "\n".join(lines),
                 {"inline_keyboard": keyboard_rows + self._room_markup(room, is_owner)["inline_keyboard"]},
+                replace_previous=start == 0,
             )
 
     async def _handle_callback(self, callback):
@@ -337,6 +384,10 @@ class TelegramPoolBot:
                     text="Откройте бота в личном чате.", show_alert=True,
                 )
             return
+        source_message_id = message.get("message_id")
+        self.callback_source_message_id = (
+            source_message_id if isinstance(source_message_id, int) else None
+        )
         if not isinstance(data, str) or not data.startswith(("sendnow:", "resend:")):
             if isinstance(data, str) and data.startswith("menu:"):
                 await self._handle_menu_callback(callback, data)
@@ -533,6 +584,7 @@ class TelegramPoolBot:
                 chat_id,
                 "\n".join(lines),
                 {"inline_keyboard": keyboard_rows + self._room_markup(room, is_owner)["inline_keyboard"]},
+                replace_previous=start == 0,
             )
 
     async def _deliver_one(self):

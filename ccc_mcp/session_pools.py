@@ -82,6 +82,11 @@ class SessionPools:
                     active_room TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS telegram_bot_ui_messages (
+                    chat_id TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    PRIMARY KEY (chat_id, message_id)
+                );
                 """
             )
             for table, column, column_type, default in (
@@ -134,6 +139,30 @@ class SessionPools:
                    VALUES ('instance_id', ?)
                    ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
                 (instance_id,),
+            )
+
+    def tracked_ui_messages(self, chat_id: str):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            return [
+                row[0]
+                for row in connection.execute(
+                    "SELECT message_id FROM telegram_bot_ui_messages WHERE chat_id = ?",
+                    (chat_id,),
+                )
+            ]
+
+    def forget_ui_message(self, chat_id: str, message_id: int):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.execute(
+                "DELETE FROM telegram_bot_ui_messages WHERE chat_id = ? AND message_id = ?",
+                (chat_id, message_id),
+            )
+
+    def track_ui_message(self, chat_id: str, message_id: int):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO telegram_bot_ui_messages (chat_id, message_id) VALUES (?, ?)",
+                (chat_id, message_id),
             )
 
     def clear_solution_queue(self) -> int:
