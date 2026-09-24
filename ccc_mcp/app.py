@@ -19,7 +19,11 @@ from starlette.responses import FileResponse, HTMLResponse, JSONResponse, PlainT
 
 from . import game_tools  # noqa: F401 -- registers game tools
 from .client import APIError, CCCClient
-from .context import account_service, team_room as team_room_context
+from .context import (
+    account_service,
+    session_pools as session_pools_context,
+    team_room as team_room_context,
+)
 from .download_links import download_links
 from .service import Service
 from .sessions import AccountSessions
@@ -302,9 +306,11 @@ class AccountMiddleware:
                         )(scope, receive, send)
                     context_token = account_service.set(service)
                     room_token = team_room_context.set(room_name)
+                    pools_token = session_pools_context.set(self.session_pools)
                     try:
                         await self.app(scope, receive, send)
                     finally:
+                        session_pools_context.reset(pools_token)
                         team_room_context.reset(room_token)
                         account_service.reset(context_token)
             except APIError as error:

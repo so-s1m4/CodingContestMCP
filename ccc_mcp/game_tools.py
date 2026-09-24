@@ -15,10 +15,9 @@ from urllib.parse import unquote
 import httpx
 from mcp.types import ImageContent
 
-from .context import current_service, current_team_room
+from .context import current_service, current_session_pools, current_team_room
 from .download_links import download_links
 from .service import compact_progress, contest_slug, segment
-from .session_pools import SessionPools
 from .telegram_state import (
     claim_solution,
     get_progress_message,
@@ -586,10 +585,7 @@ async def submit_solution(
                 if not isinstance(account_uuid, str) or not account_uuid:
                     raise ValueError("Could not verify the submitting CCC account")
                 source_suffix = account_uuid[-6:]
-                pools = SessionPools(
-                    service.client.settings.data_dir / "telegram-pools.sqlite3",
-                    service.client.settings.bot_session_encryption_key,
-                )
+                pools = current_session_pools()
                 if not team_room:
                     linked_rooms = await local(
                         lambda: pools.rooms_for_account(account_uuid)
