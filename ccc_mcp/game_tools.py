@@ -297,9 +297,19 @@ async def update_telegram_progress(configured, reset: bool = False):
                 )
                 body = response.json()
                 if response.is_success and isinstance(body, dict) and body.get("ok") is True:
+                    logger.info(
+                        "Telegram progress message updated chat=%s message_id=%s reset=%s",
+                        configured.bot_chat_id, current["message_id"], reset,
+                    )
                     return
                 description = body.get("description") if isinstance(body, dict) else None
-                if description == "Bad Request: message is not modified":
+                if isinstance(description, str) and description.startswith(
+                    "Bad Request: message is not modified"
+                ):
+                    logger.info(
+                        "Telegram progress message already has the current content chat=%s message_id=%s",
+                        configured.bot_chat_id, current["message_id"],
+                    )
                     return
                 logger.info(
                     "Telegram progress message edit failed (HTTP %s): %s; sending a replacement",
@@ -319,6 +329,10 @@ async def update_telegram_progress(configured, reset: bool = False):
                 lambda: save_progress_message(
                     progress_database, str(configured.bot_chat_id), message_id
                 )
+            )
+            logger.info(
+                "Telegram progress message sent and saved chat=%s message_id=%s reset=%s",
+                configured.bot_chat_id, message_id, reset,
             )
         else:
             description = body.get("description") if isinstance(body, dict) else None
