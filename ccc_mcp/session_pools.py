@@ -178,8 +178,10 @@ class SessionPools:
             return [
                 row[0]
                 for row in connection.execute(
-                    "SELECT room FROM telegram_room_members WHERE telegram_user_id = ? ORDER BY room",
-                    (telegram_user_id,),
+                    """SELECT room FROM telegram_room_members WHERE telegram_user_id = ?
+                       UNION SELECT name FROM telegram_rooms WHERE owner_id = ?
+                       ORDER BY 1""",
+                    (telegram_user_id, telegram_user_id),
                 ).fetchall()
             ]
 
