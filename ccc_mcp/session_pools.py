@@ -615,6 +615,126 @@ class SessionPools:
             "already_active": already_active,
         }
 
+    def self_resend_catalog(self, room: str, telegram_user_id: str):
+        """List retained levels available for a room member to resend to themselves."""
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            member = connection.execute(
+                "SELECT 1 FROM telegram_room_members WHERE room = ? AND telegram_user_id = ?",
+                (room, telegram_user_id),
+            ).fetchone()
+            if not member:
+                raise ValueError("Сначала подключите свой CCC-аккаунт к этой комнате")
+            rows = connection.execute(
+                """SELECT q.contest, q.level, q.file_id, q.game_slug
+                   FROM telegram_fanout_queue q
+                   WHERE q.room = ? AND length(q.payload) > 0
+                   ORDER BY q.created_at DESC, q.id DESC""",
+                (room,),
+            ).fetchall()
+        games = {}
+        for contest, level, file_id, game_slug in rows:
+            game = games.setdefault(
+                contest,
+                {"contest": contest, "game_slug": game_slug, "levels": {}},
+            )
+            if game["game_slug"] is None and game_slug:
+                game["game_slug"] = game_slug
+            game["levels"].setdefault(level, set()).add(file_id)
+        return [
+            {
+                "contest": game["contest"],
+                "game_slug": game["game_slug"],
+                "levels": [
+                    {"level": level, "files": len(files)}
+                    for level, files in sorted(game["levels"].items())
+                ],
+            }
+            for game in games.values()
+        ]
+
+    def resend_level_to_self(
+        self, room: str, contest: str, level: int, telegram_user_id: str
+    ):
+        """Queue every retained file of a level only for the requesting room member."""
+        now = time.time()
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            member = connection.execute(
+                """SELECT account_uuid FROM telegram_room_members
+                   WHERE room = ? AND telegram_user_id = ?""",
+                (room, telegram_user_id),
+            ).fetchone()
+            if not member:
+                raise ValueError("Сначала подключите свой CCC-аккаунт к этой комнате")
+            target_uuid = member[0]
+            payload_rows = connection.execute(
+                """SELECT file_id, filename, payload, game_slug, source_uuid
+                   FROM telegram_fanout_queue
+                   WHERE room = ? AND contest = ? AND level = ? AND length(payload) > 0
+                   ORDER BY created_at DESC, id DESC""",
+                (room, contest, level),
+            ).fetchall()
+            files = {}
+            for file_id, filename, payload, game_slug, source_uuid in payload_rows:
+                files.setdefault(
+                    file_id,
+                    {
+                        "filename": filename,
+                        "payload": payload,
+                        "game_slug": game_slug,
+                        "source_uuid": source_uuid,
+                    },
+                )
+            if not files:
+                raise ValueError("Для этого уровня больше нет сохранённых файлов повторной отправки")
+
+            queued = 0
+            already_active = 0
+            for file_id, item in files.items():
+                existing = connection.execute(
+                    """SELECT id, status FROM telegram_fanout_queue
+                       WHERE room = ? AND contest = ? AND level = ?
+                         AND file_id = ? AND target_uuid = ?""",
+                    (room, contest, level, file_id, target_uuid),
+                ).fetchone()
+                if existing and existing[1] in ("queued", "sending"):
+                    already_active += 1
+                    if existing[1] == "queued":
+                        connection.execute(
+                            """UPDATE telegram_fanout_queue
+                               SET filename = ?, payload = ?,
+                                   game_slug = COALESCE(?, game_slug)
+                               WHERE id = ? AND status = 'queued'""",
+                            (item["filename"], item["payload"], item["game_slug"], existing[0]),
+                        )
+                    continue
+                if existing:
+                    connection.execute(
+                        """UPDATE telegram_fanout_queue
+                           SET filename = ?, payload = ?,
+                               game_slug = COALESCE(?, game_slug), source_uuid = ?,
+                               run_after = ?, status = 'queued', claimed_at = NULL,
+                               manual = 0, detail = NULL, created_at = ?
+                           WHERE id = ?""",
+                        (
+                            item["filename"], item["payload"], item["game_slug"],
+                            item["source_uuid"], now, now, existing[0],
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """INSERT INTO telegram_fanout_queue
+                           (room, contest, level, file_id, filename, payload,
+                            game_slug, source_uuid, target_uuid, run_after, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            room, contest, level, file_id, item["filename"],
+                            item["payload"], item["game_slug"], item["source_uuid"],
+                            target_uuid, now, now,
+                        ),
+                    )
+                queued += 1
+        return {"queued": queued, "files": len(files), "already_active": already_active}
+
     def release_queued_batch(self, room: str, telegram_user_id: str):
         """Make every queued job immediately available to the worker."""
         with sqlite3.connect(self.database, timeout=30) as connection:
