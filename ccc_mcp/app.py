@@ -17,7 +17,7 @@ from starlette.responses import FileResponse, HTMLResponse, JSONResponse, PlainT
 
 from . import game_tools  # noqa: F401 -- registers game tools
 from .client import APIError, CCCClient
-from .context import account_service
+from .context import account_service, team_room as team_room_context
 from .download_links import download_links
 from .service import Service
 from .sessions import AccountSessions
@@ -115,6 +115,20 @@ class AccountMiddleware:
                 send,
                 401,
                 "Supply your CCC SESSION cookie value in X-CCC-Session",
+            )
+        room_values = [
+            value
+            for key, value in scope.get("headers", [])
+            if key.lower() == b"x-ccc-team-room"
+        ]
+        if len(room_values) > 1:
+            return await self.reject(
+                scope, receive, send, 400, "Supply X-CCC-Team-Room at most once"
+            )
+        room_name = room_values[0].decode("ascii", "ignore") if room_values else None
+        if room_name is not None and not re.fullmatch(r"[A-Za-z0-9_-]{3,40}", room_name):
+            return await self.reject(
+                scope, receive, send, 400, "Invalid X-CCC-Team-Room value"
             )
 
         client = self.client_factory(
@@ -283,9 +297,11 @@ class AccountMiddleware:
                             filename=path.name,
                         )(scope, receive, send)
                     context_token = account_service.set(service)
+                    room_token = team_room_context.set(room_name)
                     try:
                         await self.app(scope, receive, send)
                     finally:
+                        team_room_context.reset(room_token)
                         account_service.reset(context_token)
             except APIError as error:
                 await self.reject(
