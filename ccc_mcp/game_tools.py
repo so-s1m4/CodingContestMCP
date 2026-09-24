@@ -603,6 +603,58 @@ async def submit_solution(
                             ),
                             None,
                         )
+                        if game_slug is None:
+                            normalized_contest = "".join(
+                                char for char in source_contest.casefold()
+                                if char.isalnum()
+                            )
+                            candidates = {
+                                item.get("gameSlug")
+                                for item in trainings
+                                if isinstance(item, dict)
+                                and isinstance(item.get("gameSlug"), str)
+                                and "".join(
+                                    char for char in item["gameSlug"].casefold()
+                                    if char.isalnum()
+                                ) in normalized_contest
+                            }
+                            if candidates:
+                                longest = max(len(candidate) for candidate in candidates)
+                                best = {
+                                    candidate for candidate in candidates
+                                    if len(candidate) == longest
+                                }
+                                if len(best) == 1:
+                                    game_slug = best.pop()
+                                    logger.info(
+                                        "Resolved source training game slug from contest ID contest=%s game=%s source=CCC…%s",
+                                        source_contest, game_slug, source_suffix,
+                                    )
+                            if game_slug is None:
+                                games = await service.client.json("GET", "/api/games")
+                                if isinstance(games, list):
+                                    candidates = {
+                                        item.get("slug")
+                                        for item in games
+                                        if isinstance(item, dict)
+                                        and isinstance(item.get("slug"), str)
+                                        and "".join(
+                                            char for char in item["slug"].casefold()
+                                            if char.isalnum()
+                                        ) in normalized_contest
+                                    }
+                                    if candidates:
+                                        longest = max(len(candidate) for candidate in candidates)
+                                        best = {
+                                            candidate for candidate in candidates
+                                            if len(candidate) == longest
+                                        }
+                                        if len(best) == 1:
+                                            game_slug = best.pop()
+                                            logger.info(
+                                                "Resolved source game slug from challenge catalog contest=%s game=%s source=CCC…%s",
+                                                source_contest, game_slug, source_suffix,
+                                            )
                     if game_slug is None:
                         logger.warning(
                             "Could not resolve source training game slug contest=%s source=CCC…%s; fanout will retain the original contest ID",
@@ -672,9 +724,10 @@ async def submit_solution(
                     else:
                         fanout_status = "no new jobs: these target accounts already have this submission queued or recorded"
                         logger.info(
-                            "Accepted solution produced no new fanout jobs room=%s contest=%s level=%s file_id=%s source=CCC…%s targets=%s (duplicate queue keys)",
+                            "Accepted solution produced no new fanout jobs room=%s contest=%s level=%s file_id=%s source=CCC…%s targets=%s existing=%s statuses=%s (duplicate queue keys)",
                             team_room, contest_slug(contest), level, file_id,
-                            source_suffix, fanout["targets"],
+                            source_suffix, fanout["targets"], fanout.get("existing"),
+                            fanout.get("existing_statuses"),
                         )
             except Exception as error:
                 fanout_status = f"failed: {type(error).__name__}"

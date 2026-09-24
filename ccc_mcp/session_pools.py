@@ -493,6 +493,8 @@ class SessionPools:
     ):
         now = time.time()
         added = 0
+        requeued = 0
+        existing_statuses = {}
         delay = 0
         with sqlite3.connect(self.database, timeout=30) as connection:
             members = connection.execute(
@@ -519,7 +521,46 @@ class SessionPools:
                     ),
                 )
                 added += cursor.rowcount
-        return {"queued": added, "targets": len(members)}
+                if cursor.rowcount:
+                    continue
+                existing = connection.execute(
+                    """SELECT id, status FROM telegram_fanout_queue
+                       WHERE room = ? AND contest = ? AND level = ?
+                         AND file_id = ? AND target_uuid = ?""",
+                    (room, contest, level, file_id, target_uuid),
+                ).fetchone()
+                if not existing:
+                    continue
+                job_id, status = existing
+                existing_statuses[status] = existing_statuses.get(status, 0) + 1
+                if status in ("failed", "rejected", "cancelled"):
+                    updated = connection.execute(
+                        """UPDATE telegram_fanout_queue
+                           SET filename = ?, payload = ?, game_slug = COALESCE(?, game_slug), source_uuid = ?,
+                               run_after = ?, status = 'queued', claimed_at = NULL,
+                               manual = 0, detail = NULL
+                           WHERE id = ? AND status IN ('failed', 'rejected', 'cancelled')""",
+                        (
+                            filename, payload, game_slug, source_uuid,
+                            now + delay, job_id,
+                        ),
+                    )
+                    requeued += updated.rowcount
+                elif status == "queued":
+                    connection.execute(
+                        """UPDATE telegram_fanout_queue
+                           SET filename = ?, payload = ?,
+                               game_slug = COALESCE(?, game_slug), source_uuid = ?
+                           WHERE id = ? AND status = 'queued'""",
+                        (filename, payload, game_slug, source_uuid, job_id),
+                    )
+        return {
+            "queued": added + requeued,
+            "targets": len(members),
+            "requeued": requeued,
+            "existing": sum(existing_statuses.values()),
+            "existing_statuses": existing_statuses,
+        }
 
     def claim_due(self):
         with sqlite3.connect(self.database, timeout=30) as connection:

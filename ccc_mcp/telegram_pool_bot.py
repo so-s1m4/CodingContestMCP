@@ -39,11 +39,36 @@ class TelegramPoolBot:
 
     async def _recipient_contest(self, client: CCCClient, job) -> str:
         game_slug = job.get("game_slug")
-        if not game_slug:
-            return job["contest"]
         trainings = await client.json("GET", "/api/training/active")
         if not isinstance(trainings, list):
             raise ValueError("CCC returned an invalid active-training list")
+        if not game_slug:
+            normalized_contest = "".join(
+                char for char in job["contest"].casefold() if char.isalnum()
+            )
+            candidates = {
+                item.get("gameSlug")
+                for item in trainings
+                if isinstance(item, dict)
+                and isinstance(item.get("gameSlug"), str)
+                and "".join(
+                    char for char in item["gameSlug"].casefold() if char.isalnum()
+                ) in normalized_contest
+            }
+            if candidates:
+                longest = max(len(candidate) for candidate in candidates)
+                best = {
+                    candidate for candidate in candidates
+                    if len(candidate) == longest
+                }
+                if len(best) == 1:
+                    game_slug = best.pop()
+                    logger.info(
+                        "Derived target game slug from source contest ID job_id=%s game=%s target=CCC…%s",
+                        job["id"], game_slug, job["target_uuid"][-6:],
+                    )
+        if not game_slug:
+            return job["contest"]
         matches = [
             item
             for item in trainings
