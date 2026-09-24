@@ -4,3 +4,4 @@ python-dotenv==1.2.2
 pypdf==6.9.1
 pypdfium2==5.13.0
 Pillow==12.3.0
+cryptography==50.0.1

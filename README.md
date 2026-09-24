@@ -14,6 +14,8 @@ docker compose up --build -d
 
 When both Telegram settings are present, the server sends a startup message and keeps one editable solution message per contest and level. Accepted outputs are collected into a ZIP attached to that message; each later accepted file updates the same Telegram message and archive. The server stores sent-file keys in `CCC_DATA_DIR/telegram-sent.sqlite3` by default. `submit_solution` returns `telegram_notification` with `sent`, `updated`, `duplicate`, `disabled`, or a failure reason. Set `BOT_DEDUPE_DB` to an absolute path to override the database location.
 
+Team account pools are isolated by Telegram room. Set `BOT_SESSION_ENCRYPTION_KEY` to a persistent Fernet key (generate one with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`) and set `MCP_PUBLIC_ORIGIN` to the public HTTPS origin. In the bot's private chat, create a room with `/create_room <room> <password>`. Each participant runs `/connect <room> <password>` and receives a one-time HTTPS form for their CCC `SESSION` cookie; the bot never asks for the cookie in Telegram. The server verifies the CCC identity and encrypts the session at rest. `/disconnect <room>` revokes that participant's stored session. A successful `submit_solution` can fan out to other linked accounts by passing `team_room`; the submitting CCC account must itself be linked to that room. Fanout is queued only after CCC reports `evaluation.isCorrect: true`, and submissions are spaced by random 60–180 second intervals per target account. The bot uses Telegram long polling, so only one running server instance may poll this bot token at a time.
+
 Or with Python 3.12+: `pip install -r requirements.txt && python server.py`.
 
 ## Connect and use

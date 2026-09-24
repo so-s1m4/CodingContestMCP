@@ -1,9 +1,11 @@
 """Multi-account HTTP MCP. Website cookies are request-local; game tokens stay in RAM."""
 
+import asyncio
 import hashlib
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import uuid
 from dataclasses import replace
@@ -11,7 +13,7 @@ from urllib.parse import parse_qs
 
 import httpx
 import uvicorn
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 
 from . import game_tools  # noqa: F401 -- registers game tools
 from .client import APIError, CCCClient
@@ -19,6 +21,8 @@ from .context import account_service
 from .download_links import download_links
 from .service import Service
 from .sessions import AccountSessions
+from .session_pools import SessionPools
+from .telegram_pool_bot import TelegramPoolBot
 from .tools import create_mcp, settings
 
 logger = logging.getLogger(__name__)
@@ -30,17 +34,45 @@ class AccountMiddleware:
         self.settings = configured
         self.client_factory = client_factory
         self.game_sessions = AccountSessions()
+        self.session_pools = SessionPools(
+            self.settings.data_dir / "telegram-pools.sqlite3",
+            self.settings.bot_session_encryption_key,
+        )
+        self.telegram_task = None
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
+            async def receive_with_bot_shutdown():
+                message = await receive()
+                if message["type"] == "lifespan.shutdown" and self.telegram_task:
+                    self.telegram_task.cancel()
+                    try:
+                        await self.telegram_task
+                    except asyncio.CancelledError:
+                        pass
+                return message
+
             async def send_with_startup_notice(message):
                 if message["type"] == "lifespan.startup.complete":
+                    if self.settings.bot_token:
+                        self.telegram_task = asyncio.create_task(
+                            TelegramPoolBot(self.settings, self.session_pools).run()
+                        )
                     await self.notify_startup()
                 await send(message)
 
-            return await self.app(scope, receive, send_with_startup_notice)
+            return await self.app(
+                scope, receive_with_bot_shutdown, send_with_startup_notice
+            )
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        enrollment = re.fullmatch(
+            r"/telegram/session/([A-Za-z0-9_-]{40,60})", scope["path"]
+        )
+        if enrollment:
+            return await self.enroll_telegram_session(
+                scope, receive, send, enrollment.group(1)
+            )
         direct_download = re.fullmatch(
             r"/mcp/direct-download/([A-Za-z0-9_-]{40,60})", scope["path"]
         )
@@ -300,6 +332,106 @@ class AccountMiddleware:
             logger.warning(
                 "Startup Telegram notification failed: %s", type(error).__name__
             )
+
+    async def enroll_telegram_session(self, scope, receive, send, token):
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        if scope["method"] == "GET":
+            html = """<!doctype html><html lang="en"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>Connect CCC session</title>
+<body><main><h1>Connect CCC account</h1>
+<p>Paste the value of your CCC SESSION cookie. It is sent only to this server over HTTPS.</p>
+<form method="post"><label>CCC SESSION <input name="session" type="password" required minlength="16" maxlength="4096" autocomplete="off"></label>
+<button type="submit">Connect account</button></form></main>
+<style>body{font:16px system-ui;max-width:42rem;margin:4rem auto;padding:0 1rem}input{display:block;width:100%;padding:.8rem;margin:.5rem 0 1rem}button{padding:.7rem 1rem}</style></body></html>"""
+            return await HTMLResponse(
+                html,
+                headers={
+                    "Cache-Control": "no-store",
+                    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+                    "Referrer-Policy": "no-referrer",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )(scope, receive, send)
+        if scope["method"] != "POST":
+            return await PlainTextResponse("Use POST", status_code=405)(
+                scope, receive, send
+            )
+        if headers.get(b"content-type", b"").split(b";", 1)[0].strip() != b"application/x-www-form-urlencoded":
+            return await PlainTextResponse("Invalid form", status_code=415)(
+                scope, receive, send
+            )
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            body.extend(message.get("body", b""))
+            if len(body) > 8192:
+                return await PlainTextResponse("Form too large", status_code=413)(
+                    scope, receive, send
+                )
+            if not message.get("more_body", False):
+                break
+        form = parse_qs(body.decode("ascii", "ignore"), strict_parsing=False)
+        session = form.get("session", [""])[0]
+        if not re.fullmatch(r"[A-Za-z0-9_+/=%.-]{16,4096}", session):
+            return await PlainTextResponse(
+                "Invalid CCC session value", status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )(scope, receive, send)
+        pending = await asyncio.to_thread(
+            self.session_pools.take_enrollment_link, token
+        )
+        if not pending:
+            return await PlainTextResponse(
+                "This link expired or was already used. Request a new one from the bot.",
+                status_code=410,
+                headers={"Cache-Control": "no-store"},
+            )(scope, receive, send)
+        room, telegram_user_id = pending
+        client = self.client_factory(
+            replace(self.settings, cookie="", session=session)
+        )
+        try:
+            user = await client.json("GET", "/api/auth/current-user")
+            account_uuid = user.get("uuid") if isinstance(user, dict) else None
+            if not isinstance(account_uuid, str) or not account_uuid:
+                return await PlainTextResponse(
+                    "CCC did not authenticate this session.", status_code=401,
+                    headers={"Cache-Control": "no-store"},
+                )(scope, receive, send)
+            await asyncio.to_thread(
+                self.session_pools.save_member,
+                room, telegram_user_id, account_uuid, session,
+            )
+            if self.settings.bot_token:
+                try:
+                    async with httpx.AsyncClient(
+                        timeout=min(self.settings.timeout, 10)
+                    ) as telegram:
+                        await telegram.post(
+                            f"https://api.telegram.org/bot{self.settings.bot_token}/sendMessage",
+                            json={
+                                "chat_id": telegram_user_id,
+                                "text": f"CCC-аккаунт подключён к комнате {room}.",
+                            },
+                        )
+                except httpx.HTTPError:
+                    pass
+            return await HTMLResponse(
+                "<!doctype html><meta charset=utf-8><title>Connected</title>"
+                "<p>CCC account connected to room. You can close this page.</p>",
+                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+            )(scope, receive, send)
+        except (APIError, httpx.RequestError, ValueError, sqlite3.Error):
+            return await PlainTextResponse(
+                "Could not validate this CCC session. Request a new link and try again.",
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )(scope, receive, send)
+        finally:
+            await client.close()
 
     @staticmethod
     async def reject(scope, receive, send, status, message, retry_after=None):

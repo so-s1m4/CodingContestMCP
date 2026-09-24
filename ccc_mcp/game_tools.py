@@ -17,6 +17,7 @@ from mcp.types import ImageContent
 from .context import current_service
 from .download_links import download_links
 from .service import compact_progress, contest_slug, segment
+from .session_pools import SessionPools
 from .telegram_state import (
     claim_solution,
     delete_solution_payloads,
@@ -451,11 +452,13 @@ async def submit_solution(
     artifact_id: str | None = None,
     filename: str = "solution.out",
     include_case_details: bool = False,
+    team_room: str | None = None,
 ):
     """Submit exactly one text solution OR artifact. Use artifact_id for large outputs.
     Returns evaluation, score and cooldownSec.
     Failed-case previews are bounded and use zero-based case_index; full_result preserves the complete report.
-    No automatic retries or file-ID guessing. Check evaluation.isCorrect, not only ok."""
+    No automatic retries or file-ID guessing. Check evaluation.isCorrect, not only ok.
+    Optional team_room queues the accepted solution to other linked accounts in that room."""
 
     async def run():
         if (solution is None) == (artifact_id is None):
@@ -476,6 +479,38 @@ async def submit_solution(
             )
             if isinstance(feedback, dict):
                 feedback["telegram_notification"] = notification_status
+            if team_room is not None:
+                if not team_room:
+                    fanout_status = "failed: team_room must not be empty"
+                else:
+                    try:
+                        account = await service.client.json(
+                            "GET", "/api/auth/current-user"
+                        )
+                        account_uuid = account.get("uuid") if isinstance(account, dict) else None
+                        if not isinstance(account_uuid, str) or not account_uuid:
+                            raise ValueError("Could not verify the submitting CCC account")
+                        pools = SessionPools(
+                            service.client.settings.data_dir.parent.parent
+                            / "telegram-pools.sqlite3",
+                            service.client.settings.bot_session_encryption_key,
+                        )
+                        queued = await local(
+                            lambda: pools.enqueue_fanout(
+                                team_room,
+                                account_uuid,
+                                contest_slug(contest),
+                                level,
+                                str(file_id),
+                                filename,
+                                payload,
+                            )
+                        )
+                        fanout_status = f"queued {queued} delayed submissions"
+                    except (OSError, ValueError, sqlite3.Error) as error:
+                        fanout_status = f"failed: {str(error)[:200]}"
+                if isinstance(feedback, dict):
+                    feedback["team_fanout"] = fanout_status
         cases = evaluation.get("cases") if isinstance(evaluation, dict) else None
         if (
             isinstance(cases, list)

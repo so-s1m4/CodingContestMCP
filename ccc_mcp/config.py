@@ -19,6 +19,7 @@ class Settings:
     enable_raw_writes: bool = False
     bot_token: str = field(default="", repr=False)
     bot_chat_id: str = field(default="", repr=False)
+    bot_session_encryption_key: str = field(default="", repr=False)
     bot_dedupe_db: Path | None = None
 
     def __post_init__(self):
@@ -53,6 +54,7 @@ class Settings:
             enable_raw_writes=os.getenv("CCC_ENABLE_RAW_WRITES") == "1",
             bot_token=os.getenv("BOT_TOKEN", ""),
             bot_chat_id=os.getenv("BOT_CHAT_ID", ""),
+            bot_session_encryption_key=os.getenv("BOT_SESSION_ENCRYPTION_KEY", ""),
             bot_dedupe_db=(
                 Path(dedupe_db).resolve()
                 if dedupe_db
