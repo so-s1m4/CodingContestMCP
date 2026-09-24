@@ -7,6 +7,7 @@ import logging
 import math
 import sqlite3
 import time
+import traceback
 from dataclasses import replace
 
 import httpx
@@ -17,6 +18,14 @@ from .service import Service
 from .session_pools import SessionPools
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_error_text(error: BaseException, secrets=()) -> str:
+    text = str(error)
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    return text[:1000]
 
 
 class TelegramPoolBot:
@@ -72,7 +81,12 @@ class TelegramPoolBot:
             except asyncio.CancelledError:
                 raise
             except (httpx.HTTPError, ValueError, TypeError, KeyError) as error:
-                logger.warning("Telegram pool polling failed: %s", type(error).__name__)
+                logger.error(
+                    "Telegram pool polling failed (%s): %s\n%s",
+                    type(error).__name__,
+                    _safe_error_text(error, (self.settings.bot_token,)),
+                    "".join(traceback.format_tb(error.__traceback__)),
+                )
                 await asyncio.sleep(5)
 
     async def _handle_update(self, update):
@@ -179,9 +193,27 @@ class TelegramPoolBot:
             else:
                 await self._send(chat_id, "Неизвестная команда или неверный формат. Отправьте /help.")
         except (ValueError, sqlite3.Error) as error:
+            logger.warning(
+                "Telegram pool command rejected command=%s (%s): %s",
+                command or "empty command",
+                type(error).__name__,
+                _safe_error_text(
+                    error,
+                    (self.settings.bot_token, self.settings.bot_session_encryption_key),
+                ),
+            )
             await self._send(chat_id, str(error)[:300])
         except Exception as error:
-            logger.warning("Telegram pool command failed: %s", type(error).__name__)
+            logger.error(
+                "Telegram pool command failed for %s (%s): %s\n%s",
+                command or "empty command",
+                type(error).__name__,
+                _safe_error_text(
+                    error,
+                    (self.settings.bot_token, self.settings.bot_session_encryption_key),
+                ),
+                "".join(traceback.format_tb(error.__traceback__)),
+            )
             await self._send(chat_id, "Не удалось выполнить команду. Проверьте комнату и пароль.")
 
     @staticmethod
@@ -208,14 +240,20 @@ class TelegramPoolBot:
                 label = item["telegram_label"] or item["telegram_user_id"]
                 account_suffix = item["target_uuid"][-6:]
                 eta = self._eta(item["due_at"] - now)
+                status_text = (
+                    "  отправляется сейчас"
+                    if item["status"] == "sending"
+                    else f"  отправка через {eta}"
+                )
                 lines.append(
                     f"• #{item['job_id']} · {label} · CCC…{account_suffix}\n"
-                    f"  {item['contest']} · уровень {item['level']} · файл {item['file_id']} — через {eta}"
+                    f"  {item['contest']} · уровень {item['level']} · файл {item['file_id']} ·{status_text}"
                 )
-                button_label = f"Отправить #{item['job_id']} для {label}"
-                keyboard_rows.append(
-                    [{"text": button_label[:60], "callback_data": f"sendnow:{item['job_id']}"}]
-                )
+                if item["status"] == "queued":
+                    button_label = f"Отправить #{item['job_id']} для {label}"
+                    keyboard_rows.append(
+                        [{"text": button_label[:60], "callback_data": f"sendnow:{item['job_id']}"}]
+                    )
             await self._send(
                 chat_id,
                 "\n".join(lines),
@@ -325,7 +363,7 @@ class TelegramPoolBot:
             is_owner = await asyncio.to_thread(self.pools.is_room_owner, room, user_id)
             title = f"Комната {room} · панель создателя" if is_owner else f"Комната {room} · ваш аккаунт"
             await self._send(chat["id"], title, self._room_markup(room, is_owner))
-        elif action.startswith(("roomqueue:", "roomhistory:", "roomdisconnect:")):
+        elif action.startswith(("roomqueue:", "roomhistory:", "roommembers:", "roomdisconnect:")):
             route, room = action.split(":", 1)
             rooms = await asyncio.to_thread(self.pools.rooms_for_user, user_id)
             if room not in rooms:
@@ -342,6 +380,11 @@ class TelegramPoolBot:
                     await self._send(chat["id"], "Очередью и повторами управляет только создатель комнаты.")
                     return
                 await self._send_history(chat["id"], room, user_id)
+            elif route == "roommembers":
+                if not await asyncio.to_thread(self.pools.is_room_owner, room, user_id):
+                    await self._send(chat["id"], "Список аккаунтов комнаты доступен только её создателю.")
+                    return
+                await self._send_members(chat["id"], room, user_id)
             else:
                 removed = await asyncio.to_thread(self.pools.remove_member, room, user_id)
                 if await asyncio.to_thread(self.pools.active_room, user_id) == room:
@@ -360,12 +403,26 @@ class TelegramPoolBot:
                     {"text": "⏳ Очередь", "callback_data": f"menu:roomqueue:{room}"},
                     {"text": "📤 История и повторы", "callback_data": f"menu:roomhistory:{room}"},
                 ],
+                [{"text": "👥 Подключённые аккаунты", "callback_data": f"menu:roommembers:{room}"}],
             ])
         keyboard.append([{"text": "➖ Отключить мой аккаунт", "callback_data": f"menu:roomdisconnect:{room}"}])
         keyboard.append([{"text": "🔄 Сменить комнату", "callback_data": "menu:rooms"}])
         return {
             "inline_keyboard": keyboard
         }
+
+    async def _send_members(self, chat_id: int, room: str, user_id: str):
+        members = await asyncio.to_thread(self.pools.members_snapshot, room, user_id)
+        if not members:
+            message = f"В комнате {room} пока нет подключённых аккаунтов."
+        else:
+            lines = [f"Подключённые аккаунты комнаты {room} ({len(members)}):"]
+            for member in members:
+                label = member["telegram_label"] or member["telegram_user_id"]
+                suffix = member["account_uuid"][-6:]
+                lines.append(f"• {label} · Telegram ID {member['telegram_user_id']} · CCC…{suffix}")
+            message = "\n".join(lines)
+        await self._send(chat_id, message, self._room_markup(room, True))
 
     async def _show_room_picker(self, chat_id: int, user_id: str, action: str):
         rooms = await asyncio.to_thread(self.pools.rooms_for_user, user_id)
@@ -418,6 +475,13 @@ class TelegramPoolBot:
         job = await asyncio.to_thread(self.pools.claim_due)
         if not job:
             return False
+        target_suffix = job["target_uuid"][-6:]
+        logger.info(
+            "Claimed room queue job id=%s room=%s contest=%s level=%s file_id=%s target=CCC…%s",
+            job["id"], job["room"], job["contest"], job["level"],
+            job["file_id"], target_suffix,
+        )
+        session = None
         try:
             session = self.pools.decrypt_session(job["session_cipher"])
             client = CCCClient(replace(self.settings, cookie="", session=session))
@@ -436,32 +500,64 @@ class TelegramPoolBot:
                     self.pools.finish_job, job["id"], "sent" if success else "rejected",
                     None if success else "CCC did not accept this account's submission",
                 )
+                logger.info(
+                    "Finished room queue job id=%s status=%s room=%s target=CCC…%s",
+                    job["id"], "sent" if success else "rejected", job["room"],
+                    target_suffix,
+                )
             finally:
                 await client.close()
         except asyncio.CancelledError:
             await asyncio.to_thread(self.pools.finish_job, job["id"], "failed", "worker stopped")
+            logger.warning(
+                "Room queue job id=%s cancelled during shutdown; recorded as failed",
+                job["id"],
+            )
             raise
         except Exception as error:
-            logger.warning("Queued room submission failed: %s", type(error).__name__)
+            logger.error(
+                "Room queue job id=%s failed room=%s contest=%s level=%s file_id=%s target=CCC…%s (%s): %s\n%s",
+                job["id"], job["room"], job["contest"], job["level"],
+                job["file_id"], target_suffix, type(error).__name__,
+                _safe_error_text(
+                    error,
+                    (self.settings.bot_token, self.settings.bot_session_encryption_key, session),
+                ),
+                "".join(traceback.format_tb(error.__traceback__)),
+            )
             await asyncio.to_thread(
                 self.pools.finish_job, job["id"], "failed", type(error).__name__
             )
         return True
 
     async def _queue_loop(self):
+        last_recovery = 0.0
         while True:
             try:
+                now = time.monotonic()
+                if now - last_recovery >= 30:
+                    await asyncio.to_thread(self.pools.recover_stale_jobs)
+                    last_recovery = now
                 delivered = await self._deliver_one()
                 if not delivered:
                     await asyncio.sleep(2)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                logger.warning("Telegram room queue failed: %s", type(error).__name__)
+                logger.error(
+                    "Telegram room queue loop failed (%s): %s\n%s",
+                    type(error).__name__,
+                    _safe_error_text(
+                        error,
+                        (self.settings.bot_token, self.settings.bot_session_encryption_key),
+                    ),
+                    "".join(traceback.format_tb(error.__traceback__)),
+                )
                 await asyncio.sleep(5)
 
     async def run(self):
         if not self.settings.bot_token:
+            logger.info("Telegram pool bot disabled: BOT_TOKEN is not configured")
             return
         try:
             webhook = await self._telegram("getWebhookInfo")
@@ -469,6 +565,12 @@ class TelegramPoolBot:
                 logger.warning(
                     "Telegram pool bot needs long polling, but a webhook is configured"
                 )
-        except (httpx.HTTPError, ValueError):
-            pass
+        except (httpx.HTTPError, ValueError) as error:
+            logger.error(
+                "Could not inspect Telegram webhook status (%s): %s\n%s",
+                type(error).__name__,
+                _safe_error_text(error, (self.settings.bot_token,)),
+                "".join(traceback.format_tb(error.__traceback__)),
+            )
+        logger.info("Telegram pool bot polling and room queue workers started")
         await asyncio.gather(self._poll_loop(), self._queue_loop())

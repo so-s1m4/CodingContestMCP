@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import random
 import secrets
@@ -14,6 +15,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 
 RESEND_RETENTION_SECONDS = 30 * 24 * 60 * 60
+logger = logging.getLogger(__name__)
 
 
 class SessionPools:
@@ -60,6 +62,7 @@ class SessionPools:
                     target_uuid TEXT NOT NULL,
                     run_after REAL NOT NULL,
                     status TEXT NOT NULL DEFAULT 'queued',
+                    claimed_at REAL,
                     manual INTEGER NOT NULL DEFAULT 0,
                     detail TEXT,
                     created_at REAL NOT NULL,
@@ -93,11 +96,43 @@ class SessionPools:
                     connection.execute(
                         f"ALTER TABLE {table} ADD COLUMN {column} {column_type} NOT NULL DEFAULT {default}"
                     )
+            queue_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(telegram_fanout_queue)")
+            }
+            if "claimed_at" not in queue_columns:
+                connection.execute(
+                    "ALTER TABLE telegram_fanout_queue ADD COLUMN claimed_at REAL"
+                )
             connection.execute(
                 """UPDATE telegram_fanout_queue SET payload = X''
                    WHERE status IN ('sent', 'rejected', 'failed') AND created_at < ?""",
                 (time.time() - RESEND_RETENTION_SECONDS,),
             )
+        self.recover_stale_jobs()
+
+    def recover_stale_jobs(self, stale_after: int = 600):
+        """Requeue claims abandoned by a killed worker after a safety timeout."""
+        now = time.time()
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.execute(
+                """UPDATE telegram_fanout_queue SET claimed_at = run_after
+                   WHERE status = 'sending' AND claimed_at IS NULL"""
+            )
+            recovered = connection.execute(
+                """UPDATE telegram_fanout_queue
+                   SET status = 'queued', claimed_at = NULL,
+                       run_after = MIN(run_after, ?),
+                       detail = 'Recovered after interrupted worker'
+                   WHERE status = 'sending' AND claimed_at <= ?""",
+                (now, now - stale_after),
+            ).rowcount
+        if recovered:
+            logger.warning(
+                "Recovered %s room queue job(s) left in sending after worker interruption",
+                recovered,
+            )
+        return recovered
 
     @staticmethod
     def _password_hash(password: str, salt: bytes) -> bytes:
@@ -222,6 +257,25 @@ class SessionPools:
                 ).fetchall()
             ]
 
+    def members_snapshot(self, room: str, telegram_user_id: str):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            if not self._can_manage_room(connection, room, telegram_user_id):
+                raise ValueError("Only the room creator can view its connected accounts")
+            rows = connection.execute(
+                """SELECT telegram_label, telegram_user_id, account_uuid, added_at
+                   FROM telegram_room_members WHERE room = ? ORDER BY added_at""",
+                (room,),
+            ).fetchall()
+        return [
+            {
+                "telegram_label": row[0],
+                "telegram_user_id": row[1],
+                "account_uuid": row[2],
+                "added_at": row[3],
+            }
+            for row in rows
+        ]
+
     def set_active_room(self, room: str | None, telegram_user_id: str):
         with sqlite3.connect(self.database, timeout=30) as connection:
             if room is None:
@@ -279,13 +333,14 @@ class SessionPools:
                 """SELECT q.id, q.contest, q.level, q.file_id, q.target_uuid,
                           m.telegram_label, m.telegram_user_id,
                           CASE WHEN q.manual = 1 THEN q.run_after
-                               ELSE MAX(q.run_after, COALESCE(t.next_send_at, 0)) END
+                               ELSE MAX(q.run_after, COALESCE(t.next_send_at, 0)) END,
+                          q.status
                    FROM telegram_fanout_queue q
                    JOIN telegram_room_members m
                      ON m.room = q.room AND m.account_uuid = q.target_uuid
                    LEFT JOIN telegram_target_cooldowns t
                      ON t.room = q.room AND t.account_uuid = q.target_uuid
-                   WHERE q.room = ? AND q.status = 'queued'
+                   WHERE q.room = ? AND q.status IN ('queued', 'sending')
                    ORDER BY 8, q.id""",
                 (room,),
             ).fetchall()
@@ -299,6 +354,7 @@ class SessionPools:
                 "telegram_label": row[5],
                 "telegram_user_id": row[6],
                 "due_at": row[7],
+                "status": row[8],
             }
             for row in rows
         ]
@@ -416,7 +472,7 @@ class SessionPools:
                     ),
                 )
                 added += cursor.rowcount
-        return added
+        return {"queued": added, "targets": len(members)}
 
     def claim_due(self):
         with sqlite3.connect(self.database, timeout=30) as connection:
@@ -444,8 +500,9 @@ class SessionPools:
                 )
                 return None
             connection.execute(
-                "UPDATE telegram_fanout_queue SET status = 'sending' WHERE id = ?",
-                (row["id"],),
+                """UPDATE telegram_fanout_queue
+                   SET status = 'sending', claimed_at = ? WHERE id = ?""",
+                (time.time(), row["id"]),
             )
             return dict(row)
 
@@ -474,6 +531,7 @@ class SessionPools:
                         (row[0], row[1], next_send_at),
                     )
             connection.execute(
-                "UPDATE telegram_fanout_queue SET status = ?, detail = ? WHERE id = ?",
+                """UPDATE telegram_fanout_queue
+                   SET status = ?, detail = ?, claimed_at = NULL WHERE id = ?""",
                 (status, detail, job_id),
             )

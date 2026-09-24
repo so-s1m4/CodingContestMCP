@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import traceback
 import uuid
 from dataclasses import replace
 from urllib.parse import parse_qs
@@ -345,8 +346,14 @@ class AccountMiddleware:
                 description if isinstance(description, str) else "unknown error",
             )
         except (httpx.HTTPError, ValueError) as error:
-            logger.warning(
-                "Startup Telegram notification failed: %s", type(error).__name__
+            detail = str(error)
+            if self.settings.bot_token:
+                detail = detail.replace(self.settings.bot_token, "[redacted]")
+            logger.error(
+                "Startup Telegram notification failed (%s): %s\n%s",
+                type(error).__name__,
+                detail[:1000],
+                "".join(traceback.format_tb(error.__traceback__)),
             )
 
     async def enroll_telegram_session(self, scope, receive, send, token):
