@@ -24,7 +24,7 @@ async def _notify_telegram_solution(
 ):
     settings = service.client.settings
     if not settings.bot_token or not settings.bot_chat_id:
-        return "disabled"
+        return "disabled: configure BOT_TOKEN and BOT_CHAT_ID on the MCP server"
 
     database = settings.bot_dedupe_db or settings.data_dir / "telegram-sent.sqlite3"
     slug = contest_slug(contest)
@@ -50,6 +50,7 @@ async def _notify_telegram_solution(
         f"#contest_{tag(slug)} #level_{level} #file_{tag(str(file_id))}"
     )
     status = "uncertain"
+    detail = None
     try:
         async with httpx.AsyncClient(timeout=settings.timeout) as client:
             response = await client.post(
@@ -60,9 +61,16 @@ async def _notify_telegram_solution(
         body = response.json()
         if isinstance(body, dict) and body.get("ok") is False:
             status = "failed"
+            description = body.get("description")
             logger.warning(
-                "Telegram solution notification failed (HTTP %s)",
+                "Telegram solution notification failed (HTTP %s): %s",
                 response.status_code,
+                description if isinstance(description, str) else "Bot API rejected the request",
+            )
+            detail = (
+                description[:300]
+                if isinstance(description, str)
+                else "Telegram Bot API rejected the request"
             )
         elif response.is_success and isinstance(body, dict) and body.get("ok") is True:
             status = "sent"
@@ -86,7 +94,7 @@ async def _notify_telegram_solution(
             "Could not update Telegram notification state: %s",
             type(error).__name__,
         )
-    return status
+    return f"{status}: {detail}" if detail else status
 
 
 @tool(read_only=False)

@@ -11,11 +11,10 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import McpError
 
 
@@ -40,6 +39,28 @@ async def upload(session, path: Path, limit: int):
     )
 
 
+async def upload_http(http, url, path: Path, limit: int):
+    size = path.stat().st_size
+    if size > limit:
+        raise ValueError("File exceeds --max-bytes")
+
+    async def chunks():
+        with path.open("rb") as source:
+            while chunk := await asyncio.to_thread(source.read, 262144):
+                yield chunk
+
+    response = await http.post(
+        f"{url.rstrip('/')}/artifacts/upload?{urlencode({'filename': path.name})}",
+        content=chunks(),
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    response.raise_for_status()
+    metadata = response.json()
+    if metadata.get("bytes") != size:
+        raise ValueError("Upload size did not match the local file")
+    return metadata
+
+
 async def transfer(args, cookie):
     async with httpx.AsyncClient(
         headers={"X-CCC-Session": cookie},
@@ -50,7 +71,7 @@ async def transfer(args, cookie):
             return await download_http(
                 http, args.url, args.artifact_id, args.path, args.max_bytes
             )
-        return await upload_mcp(http, args)
+        return await upload_http(http, args.url, args.path, args.max_bytes)
 
 
 async def download_http(http, url, artifact, path, limit):
@@ -75,15 +96,6 @@ async def download_http(http, url, artifact, path, limit):
             target.flush()
             os.link(target.name, path)
     return {"path": str(path), "bytes": size, "sha256": digest.hexdigest()}
-
-
-async def upload_mcp(http, args):
-    async with (
-        streamable_http_client(args.url, http_client=http) as (read, write, _),
-        ClientSession(read, write) as session,
-    ):
-        await session.initialize()
-        return await upload(session, args.path, args.max_bytes)
 
 
 def main():

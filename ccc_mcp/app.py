@@ -4,7 +4,10 @@ import hashlib
 import logging
 import os
 import re
+import tempfile
+import uuid
 from dataclasses import replace
+from urllib.parse import parse_qs
 
 import httpx
 import uvicorn
@@ -18,6 +21,8 @@ from .service import Service
 from .sessions import AccountSessions
 from .tools import create_mcp, settings
 
+logger = logging.getLogger(__name__)
+
 
 class AccountMiddleware:
     def __init__(self, app, configured, client_factory=CCCClient):
@@ -27,6 +32,13 @@ class AccountMiddleware:
         self.game_sessions = AccountSessions()
 
     async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            async def send_with_startup_notice(message):
+                if message["type"] == "lifespan.startup.complete":
+                    await self.notify_startup()
+                await send(message)
+
+            return await self.app(scope, receive, send_with_startup_notice)
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         direct_download = re.fullmatch(
@@ -52,6 +64,7 @@ class AccountMiddleware:
                 },
                 filename=filename,
             )(scope, receive, send)
+        artifact_upload = scope["path"] == "/mcp/artifacts/upload"
         artifact_route = scope["path"].startswith("/mcp/artifacts/")
         if scope["path"].rstrip("/") != "/mcp" and not artifact_route:
             return await self.app(scope, receive, send)
@@ -124,6 +137,97 @@ class AccountMiddleware:
             try:
                 with self.game_sessions.use(account) as games:
                     service = Service(client, games)
+                    if artifact_upload:
+                        if scope["method"] != "POST":
+                            return await self.reject(
+                                scope,
+                                receive,
+                                send,
+                                405,
+                                "Use POST for artifact uploads",
+                            )
+                        content_type = next(
+                            (
+                                value.split(b";", 1)[0].strip().lower()
+                                for key, value in scope.get("headers", [])
+                                if key.lower() == b"content-type"
+                            ),
+                            b"",
+                        )
+                        if content_type != b"application/octet-stream":
+                            return await self.reject(
+                                scope,
+                                receive,
+                                send,
+                                415,
+                                "Upload as application/octet-stream",
+                            )
+                        query = parse_qs(
+                            scope.get("query_string", b"").decode("ascii", "ignore")
+                        )
+                        filename = query.get("filename", ["solution.out"])[0]
+                        if (
+                            not filename
+                            or filename in (".", "..")
+                            or "/" in filename
+                            or "\\" in filename
+                            or len(filename) > 255
+                        ):
+                            return await self.reject(
+                                scope, receive, send, 400, "Invalid filename"
+                            )
+                        root = service.artifacts.root
+                        temporary = None
+                        digest = hashlib.sha256()
+                        size = 0
+                        try:
+                            with tempfile.NamedTemporaryFile(
+                                mode="wb", dir=root, delete=False
+                            ) as target:
+                                temporary = target.name
+                                while True:
+                                    message = await receive()
+                                    if message["type"] == "http.disconnect":
+                                        raise ConnectionError("Upload disconnected")
+                                    chunk = message.get("body", b"")
+                                    size += len(chunk)
+                                    if size > client.settings.max_bytes:
+                                        return await self.reject(
+                                            scope,
+                                            receive,
+                                            send,
+                                            413,
+                                            "File exceeds CCC_MAX_FILE_BYTES",
+                                        )
+                                    target.write(chunk)
+                                    digest.update(chunk)
+                                    if not message.get("more_body", False):
+                                        break
+                            artifact = uuid.uuid4().hex
+                            path = root / artifact
+                            os.replace(temporary, path)
+                            temporary = None
+                            return await JSONResponse(
+                                {
+                                    "artifact_id": artifact,
+                                    "filename": filename,
+                                    "bytes": size,
+                                    "sha256": digest.hexdigest(),
+                                },
+                                headers={"Cache-Control": "no-store"},
+                            )(scope, receive, send)
+                        except ConnectionError:
+                            return
+                        except OSError:
+                            return await self.reject(
+                                scope, receive, send, 500, "Could not store artifact"
+                            )
+                        finally:
+                            if temporary:
+                                try:
+                                    os.unlink(temporary)
+                                except FileNotFoundError:
+                                    pass
                     if artifact_route:
                         if scope["method"] not in ("GET", "HEAD"):
                             return await self.reject(
@@ -162,6 +266,40 @@ class AccountMiddleware:
                 )
         finally:
             await client.close()
+
+    async def notify_startup(self):
+        if not self.settings.bot_token or not self.settings.bot_chat_id:
+            logger.info(
+                "Startup Telegram notification skipped: BOT_TOKEN or BOT_CHAT_ID is not configured"
+            )
+            return
+        try:
+            async with httpx.AsyncClient(timeout=min(self.settings.timeout, 10)) as client:
+                response = await client.post(
+                    f"https://api.telegram.org/bot{self.settings.bot_token}/sendMessage",
+                    json={
+                        "chat_id": self.settings.bot_chat_id,
+                        "text": "✅ CodingContest MCP успешно запущен.",
+                    },
+                )
+            body = response.json()
+            if response.is_success and isinstance(body, dict) and body.get("ok") is True:
+                logger.info("Startup Telegram notification sent")
+                return
+            description = (
+                body.get("description")
+                if isinstance(body, dict)
+                else "Telegram returned an invalid response"
+            )
+            logger.warning(
+                "Startup Telegram notification failed (HTTP %s): %s",
+                response.status_code,
+                description if isinstance(description, str) else "unknown error",
+            )
+        except (httpx.HTTPError, ValueError) as error:
+            logger.warning(
+                "Startup Telegram notification failed: %s", type(error).__name__
+            )
 
     @staticmethod
     async def reject(scope, receive, send, status, message, retry_after=None):

@@ -8,6 +8,8 @@ services:
     environment:
       MCP_HOST: 0.0.0.0
       CCC_DATA_DIR: /data
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      BOT_CHAT_ID: ${BOT_CHAT_ID:-}
     volumes:
       - ccc-data:/data
     restart: unless-stopped
