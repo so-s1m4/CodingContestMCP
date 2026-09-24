@@ -430,21 +430,6 @@ class SessionPools:
             for row in rows
         ]
 
-    def release_job_now(self, job_id: int, telegram_user_id: str):
-        with sqlite3.connect(self.database, timeout=30) as connection:
-            job = connection.execute(
-                """SELECT room, target_uuid FROM telegram_fanout_queue
-                   WHERE id = ? AND status = 'queued'""",
-                (job_id,),
-            ).fetchone()
-            if not job or not self._can_manage_room(connection, job[0], telegram_user_id):
-                raise ValueError("Only the room creator can manage its queue")
-            connection.execute(
-                "UPDATE telegram_fanout_queue SET run_after = ?, manual = 1 WHERE id = ?",
-                (time.time(), job_id),
-            )
-            return True
-
     def history_snapshot(self, room: str, telegram_user_id: str, limit: int = 20):
         with sqlite3.connect(self.database, timeout=30) as connection:
             if not self._can_manage_room(connection, room, telegram_user_id):
@@ -734,19 +719,6 @@ class SessionPools:
                     )
                 queued += 1
         return {"queued": queued, "files": len(files), "already_active": already_active}
-
-    def release_queued_batch(self, room: str, telegram_user_id: str):
-        """Make every queued job immediately available to the worker."""
-        with sqlite3.connect(self.database, timeout=30) as connection:
-            if not self._can_manage_room(connection, room, telegram_user_id):
-                raise ValueError("Only the room creator can manage its queue")
-            now = time.time()
-            return connection.execute(
-                """UPDATE telegram_fanout_queue
-                   SET run_after = ?, manual = 0
-                   WHERE room = ? AND status = 'queued'""",
-                (now, room),
-            ).rowcount
 
     def resend_job(self, job_id: int, telegram_user_id: str):
         with sqlite3.connect(self.database, timeout=30) as connection:

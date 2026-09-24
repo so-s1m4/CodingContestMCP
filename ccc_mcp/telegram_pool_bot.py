@@ -245,8 +245,7 @@ class TelegramPoolBot:
                     "/connect <комната> <пароль> — подключить CCC-аккаунт через одноразовую HTTPS-форму\n"
                     "/disconnect <комната> — удалить свою сессию из комнаты\n"
                     "/rooms — показать ваши комнаты\n"
-                    "/queue <комната> — показать ожидающие аккаунты и сроки\n"
-                    "/send_now <ID> — запустить одну выбранную отправку\n"
+                    "/queue <комната> — показать ожидающие отправки\n"
                     "/history <комната> — последние отправки с файлами для повтора\n"
                     "/resend <ID> — повторить отправку выбранному аккаунту",
                 )
@@ -290,14 +289,6 @@ class TelegramPoolBot:
                 await self._send_queue(chat_id, parts[1], user)
             elif command == "/history" and len(parts) == 2:
                 await self._send_history(chat_id, parts[1], user)
-            elif command == "/send_now" and len(parts) == 2 and parts[1].isdigit():
-                await asyncio.to_thread(
-                    self.pools.release_job_now, int(parts[1]), user
-                )
-                await self._send(
-                    chat_id,
-                    f"Отправка #{parts[1]} для выбранного аккаунта поставлена на ближайшее время.",
-                )
             elif command == "/resend" and len(parts) == 2 and parts[1].isdigit():
                 await asyncio.to_thread(self.pools.resend_job, int(parts[1]), user)
                 await self._send(
@@ -339,7 +330,6 @@ class TelegramPoolBot:
         for start in range(0, len(items), 12):
             chunk = items[start : start + 12]
             lines = [f"Ожидающие отправки в комнате {room} ({start + 1}–{start + len(chunk)} из {len(items)}):"]
-            keyboard_rows = []
             for item in chunk:
                 label = item["telegram_label"] or item["telegram_user_id"]
                 account_suffix = item["target_uuid"][-6:]
@@ -352,15 +342,10 @@ class TelegramPoolBot:
                     f"• #{item['job_id']} · {label} · CCC…{account_suffix}\n"
                     f"  {item['contest']} · уровень {item['level']} · файл {item['file_id']} ·{status_text}"
                 )
-                if item["status"] == "queued":
-                    button_label = f"Отправить #{item['job_id']} для {label}"
-                    keyboard_rows.append(
-                        [{"text": button_label[:60], "callback_data": f"sendnow:{item['job_id']}"}]
-                    )
             await self._send(
                 chat_id,
                 "\n".join(lines),
-                {"inline_keyboard": keyboard_rows + self._room_markup(room, is_owner)["inline_keyboard"]},
+                self._room_markup(room, is_owner),
                 replace_previous=start == 0,
             )
 
@@ -387,10 +372,14 @@ class TelegramPoolBot:
         if isinstance(data, str) and data.startswith("selfreplay:"):
             await self._handle_self_replay_callback(callback, data)
             return
-        if isinstance(data, str) and data.startswith("queueall:"):
-            await self._handle_queueall_callback(callback, data)
+        if isinstance(data, str) and data.startswith(("sendnow:", "queueall:")):
+            await self._telegram(
+                "answerCallbackQuery",
+                callback_query_id=callback_id,
+                text="Очередь отправляется автоматически — эта кнопка больше не нужна.",
+            )
             return
-        if not isinstance(data, str) or not data.startswith(("sendnow:", "resend:")):
+        if not isinstance(data, str) or not data.startswith("resend:"):
             if isinstance(data, str) and data.startswith("menu:"):
                 await self._handle_menu_callback(callback, data)
             return
@@ -398,18 +387,11 @@ class TelegramPoolBot:
         if not raw_job_id.isdigit():
             return
         try:
-            if action == "resend":
-                await asyncio.to_thread(
-                    self.pools.resend_job, int(raw_job_id), str(sender["id"])
-                )
-                message_text = f"Повтор отправки #{raw_job_id} выбранному аккаунту поставлен на ближайшее время."
-                callback_text = "Повтор для этого аккаунта запущен."
-            else:
-                await asyncio.to_thread(
-                    self.pools.release_job_now, int(raw_job_id), str(sender["id"])
-                )
-                message_text = f"Отправка #{raw_job_id} для выбранного аккаунта поставлена на ближайшее время."
-                callback_text = "Отправка для этого аккаунта запущена."
+            await asyncio.to_thread(
+                self.pools.resend_job, int(raw_job_id), str(sender["id"])
+            )
+            message_text = f"Повтор отправки #{raw_job_id} выбранному аккаунту поставлен в очередь."
+            callback_text = "Повтор для этого аккаунта запущен."
             await self._telegram(
                 "answerCallbackQuery", callback_query_id=callback_id,
                 text=callback_text,
@@ -482,25 +464,6 @@ class TelegramPoolBot:
                 "catalog": catalog,
             }
             await self._render_replay_games(chat["id"], flow_id)
-        elif action.startswith("queueall:"):
-            room = action.split(":", 1)[1]
-            if not await asyncio.to_thread(self.pools.is_room_owner, room, user_id):
-                await self._send(chat["id"], "Управлять очередью может только создатель комнаты.")
-                return
-            items = await asyncio.to_thread(self.pools.queue_snapshot, room, user_id)
-            count = sum(item["status"] == "queued" for item in items)
-            if not count:
-                await self._send(chat["id"], "В очереди нет ожидающих отправок.", self._room_markup(room, True))
-                return
-            await self._send(
-                chat["id"],
-                f"Подтвердить запуск всех {count} ожидающих отправок комнаты {room}?\n"
-                "Все ожидающие отправки будут переданы worker сразу.",
-                {"inline_keyboard": [[
-                    {"text": f"✅ Подтвердить все ({count})", "callback_data": f"queueall:confirm:{room}"},
-                    {"text": "Отмена", "callback_data": f"queueall:cancel:{room}"},
-                ]]},
-            )
         elif action == "rooms":
             rooms = await asyncio.to_thread(self.pools.rooms_for_user, user_id)
             if not rooms:
@@ -588,7 +551,6 @@ class TelegramPoolBot:
                 ],
                 [
                     {"text": "🔁 Повторить уровень", "callback_data": f"menu:replay:{room}"},
-                    {"text": "🚀 Подтвердить очередь", "callback_data": f"menu:queueall:{room}"},
                 ],
                 [{"text": "👥 Подключённые аккаунты", "callback_data": f"menu:roommembers:{room}"}],
             ])
@@ -889,44 +851,6 @@ class TelegramPoolBot:
                 await self._send(chat_id, text, self._room_markup(flow["room"], True))
             except (ValueError, sqlite3.Error) as error:
                 await self._send(chat_id, str(error)[:500], self._room_markup(flow["room"], True))
-
-    async def _handle_queueall_callback(self, callback, data: str):
-        callback_id = callback.get("id")
-        sender = callback.get("from") or {}
-        message = callback.get("message") or {}
-        chat = message.get("chat") or {}
-        parts = data.split(":", 2)
-        if chat.get("type") != "private" or not isinstance(sender.get("id"), int):
-            await self._telegram(
-                "answerCallbackQuery", callback_query_id=callback_id,
-                text="Откройте меню в личном чате с ботом.", show_alert=True,
-            )
-            return
-        if len(parts) != 3:
-            return
-        _, action, room = parts
-        await self._telegram("answerCallbackQuery", callback_query_id=callback_id)
-        if action == "cancel":
-            await self._send(chat["id"], "Массовый запуск отменён.", self._room_markup(room, True))
-            return
-        if action != "confirm":
-            return
-        try:
-            count = await asyncio.to_thread(
-                self.pools.release_queued_batch, room, str(sender["id"])
-            )
-            self.queue_wakeup.set()
-            await self._send(
-                chat["id"],
-                f"🚀 В работу сразу передано {count} отправок без искусственных задержек. Статус можно посмотреть в очереди.",
-                {
-                    "inline_keyboard": [[
-                        {"text": "⏳ Смотреть очередь", "callback_data": f"menu:roomqueue:{room}"}
-                    ]]
-                },
-            )
-        except (ValueError, sqlite3.Error) as error:
-            await self._send(chat["id"], str(error)[:500])
 
     async def _send_members(self, chat_id: int, room: str, user_id: str):
         members = await asyncio.to_thread(self.pools.members_snapshot, room, user_id)
