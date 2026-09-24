@@ -90,61 +90,51 @@ async def _notify_telegram_solution(
             if expected_files:
                 passed = len(accepted_ids.intersection(expected_files))
                 progress = f"{passed}/{len(expected_files)} files passed"
-                complete = set(expected_files).issubset(accepted_ids)
             else:
                 progress = f"{len(entries)} files passed"
-                complete = False
-            refresh_archive = not batch["message_id"] or complete or not expected_files
             caption = (
                 f"✅ {slug} · Level {level} · {progress}\n"
                 f"#contest_{tag(slug)} #level_{level}"
             )
-            if expected_files and not complete:
-                caption += "\nПолный архив обновится, когда пройдут все файлы уровня."
 
-            if refresh_archive:
-                def build_archive():
-                    with tempfile.NamedTemporaryFile(
-                        suffix=".zip", dir=database.parent, delete=False
-                    ) as archive_file:
-                        archive_path = Path(archive_file.name)
-                    manifest = [
-                        f"Contest: {slug}",
-                        f"Level: {level}",
-                        f"Progress: {progress}",
-                        "",
-                        "Accepted files:",
-                    ]
-                    with zipfile.ZipFile(
-                        archive_path, "w", compression=zipfile.ZIP_DEFLATED
-                    ) as archive:
-                        for entry in entries:
-                            safe_id = tag(entry["file_id"])
-                            safe_name = Path(entry["filename"]).name
-                            safe_name = "".join(
-                                char
-                                if char.isalnum() or char in "._-"
-                                else "_"
-                                for char in safe_name
-                            ) or "solution.out"
-                            archive.write(
-                                entry["path"], f"answers/{safe_id}-{safe_name}"
-                            )
-                            manifest.append(
-                                f"- {entry['file_id']}: {entry['filename']} (accepted)"
-                            )
-                        archive.writestr("summary.txt", "\n".join(manifest) + "\n")
-                    return archive_path
+            def build_archive():
+                with tempfile.NamedTemporaryFile(
+                    suffix=".zip", dir=database.parent, delete=False
+                ) as archive_file:
+                    archive_path = Path(archive_file.name)
+                manifest = [
+                    f"Contest: {slug}",
+                    f"Level: {level}",
+                    f"Progress: {progress}",
+                    "",
+                    "Accepted files:",
+                ]
+                with zipfile.ZipFile(
+                    archive_path, "w", compression=zipfile.ZIP_DEFLATED
+                ) as archive:
+                    for entry in entries:
+                        safe_id = tag(entry["file_id"])
+                        safe_name = Path(entry["filename"]).name
+                        safe_name = "".join(
+                            char
+                            if char.isalnum() or char in "._-"
+                            else "_"
+                            for char in safe_name
+                        ) or "solution.out"
+                        archive.write(
+                            entry["path"], f"answers/{safe_id}-{safe_name}"
+                        )
+                        manifest.append(
+                            f"- {entry['file_id']}: {entry['filename']} (accepted)"
+                        )
+                    archive.writestr("summary.txt", "\n".join(manifest) + "\n")
+                return archive_path
 
-                archive_path = await local(build_archive)
-            else:
-                archive_path = None
+            archive_path = await local(build_archive)
             method = (
                 "sendDocument"
                 if not batch["message_id"]
                 else "editMessageMedia"
-                if refresh_archive
-                else "editMessageCaption"
             )
             url = f"https://api.telegram.org/bot{settings.bot_token}/{method}"
             if method == "editMessageMedia":
@@ -160,33 +150,24 @@ async def _notify_telegram_solution(
                     "message_id": batch["message_id"],
                     "media": media,
                 }
-            elif method == "editMessageCaption":
-                data = {
-                    "chat_id": settings.bot_chat_id,
-                    "message_id": batch["message_id"],
-                    "caption": caption,
-                }
             else:
                 data = {"chat_id": settings.bot_chat_id, "caption": caption}
             status = "uncertain"
             detail = None
             try:
                 async with httpx.AsyncClient(timeout=settings.timeout) as client:
-                    if archive_path:
-                        with archive_path.open("rb") as document:
-                            response = await client.post(
-                                url,
-                                data=data,
-                                files={
-                                    "document": (
-                                        f"{tag(slug)}-level-{level}-solutions.zip",
-                                        document,
-                                        "application/zip",
-                                    )
-                                },
-                            )
-                    else:
-                        response = await client.post(url, data=data)
+                    with archive_path.open("rb") as document:
+                        response = await client.post(
+                            url,
+                            data=data,
+                            files={
+                                "document": (
+                                    f"{tag(slug)}-level-{level}-solutions.zip",
+                                    document,
+                                    "application/zip",
+                                )
+                            },
+                        )
                 body = response.json()
                 result_body = body.get("result") if isinstance(body, dict) else None
                 message_id = (
@@ -233,11 +214,10 @@ async def _notify_telegram_solution(
                     "Telegram level bundle failed: %s", type(error).__name__
                 )
             finally:
-                if archive_path:
-                    try:
-                        archive_path.unlink()
-                    except FileNotFoundError:
-                        pass
+                try:
+                    archive_path.unlink()
+                except FileNotFoundError:
+                    pass
             await local(
                 lambda: update_solution_status(
                     database, slug, level, str(file_id), status
