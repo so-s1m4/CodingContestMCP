@@ -586,6 +586,33 @@ async def submit_solution(
                     raise ValueError("Could not verify the submitting CCC account")
                 source_suffix = account_uuid[-6:]
                 pools = current_session_pools()
+                game_slug = None
+                source_contest = contest_slug(contest)
+                try:
+                    trainings = await service.client.json(
+                        "GET", "/api/training/active"
+                    )
+                    if isinstance(trainings, list):
+                        game_slug = next(
+                            (
+                                item.get("gameSlug")
+                                for item in trainings
+                                if isinstance(item, dict)
+                                and item.get("contestName") == source_contest
+                                and isinstance(item.get("gameSlug"), str)
+                            ),
+                            None,
+                        )
+                    if game_slug is None:
+                        logger.warning(
+                            "Could not resolve source training game slug contest=%s source=CCC…%s; fanout will retain the original contest ID",
+                            source_contest, source_suffix,
+                        )
+                except Exception as error:
+                    logger.warning(
+                        "Could not read source training identity contest=%s source=CCC…%s (%s); fanout will retain the original contest ID",
+                        source_contest, source_suffix, type(error).__name__,
+                    )
                 if not team_room:
                     linked_rooms = await local(
                         lambda: pools.rooms_for_account(account_uuid)
@@ -620,18 +647,19 @@ async def submit_solution(
                         lambda: pools.enqueue_fanout(
                             team_room,
                             account_uuid,
-                            contest_slug(contest),
+                            source_contest,
                             level,
                             str(file_id),
                             filename,
                             payload,
+                            game_slug,
                         )
                     )
                     if fanout["queued"]:
                         fanout_status = f"queued {fanout['queued']} delayed submissions"
                         logger.info(
                             "Accepted solution added to room fanout room=%s contest=%s level=%s file_id=%s source=CCC…%s queued=%s targets=%s",
-                            team_room, contest_slug(contest), level, file_id,
+                            team_room, source_contest, level, file_id,
                             source_suffix, fanout["queued"], fanout["targets"],
                         )
                     elif not fanout["targets"]:

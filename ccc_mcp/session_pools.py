@@ -58,6 +58,7 @@ class SessionPools:
                     file_id TEXT NOT NULL,
                     filename TEXT NOT NULL,
                     payload BLOB NOT NULL,
+                    game_slug TEXT,
                     source_uuid TEXT NOT NULL,
                     target_uuid TEXT NOT NULL,
                     run_after REAL NOT NULL,
@@ -87,6 +88,7 @@ class SessionPools:
                 ("telegram_room_members", "telegram_label", "TEXT", "''"),
                 ("telegram_enrollment_links", "telegram_label", "TEXT", "''"),
                 ("telegram_fanout_queue", "manual", "INTEGER", "0"),
+                ("telegram_fanout_queue", "game_slug", "TEXT", "''"),
             ):
                 columns = {
                     row[1]
@@ -487,6 +489,7 @@ class SessionPools:
         file_id: str,
         filename: str,
         payload: bytes,
+        game_slug: str | None = None,
     ):
         now = time.time()
         added = 0
@@ -507,11 +510,11 @@ class SessionPools:
                 delay += random.randint(60, 180)
                 cursor = connection.execute(
                     """INSERT OR IGNORE INTO telegram_fanout_queue
-                       (room, contest, level, file_id, filename, payload, source_uuid,
+                       (room, contest, level, file_id, filename, payload, game_slug, source_uuid,
                         target_uuid, run_after, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        room, contest, level, file_id, filename, payload,
+                        room, contest, level, file_id, filename, payload, game_slug,
                         source_uuid, target_uuid, now + delay, now,
                     ),
                 )

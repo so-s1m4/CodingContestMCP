@@ -8,6 +8,7 @@ import math
 import sqlite3
 import time
 import traceback
+from datetime import datetime, timezone
 from dataclasses import replace
 
 import httpx
@@ -35,6 +36,44 @@ class TelegramPoolBot:
         self.base = f"https://api.telegram.org/bot{settings.bot_token}"
         self.offset = 0
         self.pending_actions = {}
+
+    async def _recipient_contest(self, client: CCCClient, job) -> str:
+        game_slug = job.get("game_slug")
+        if not game_slug:
+            return job["contest"]
+        trainings = await client.json("GET", "/api/training/active")
+        if not isinstance(trainings, list):
+            raise ValueError("CCC returned an invalid active-training list")
+        matches = [
+            item
+            for item in trainings
+            if isinstance(item, dict)
+            and item.get("gameSlug") == game_slug
+            and isinstance(item.get("contestName"), str)
+        ]
+        now = datetime.now(timezone.utc)
+        active = []
+        for item in matches:
+            try:
+                start_time = item.get("startTime")
+                if not isinstance(start_time, str):
+                    continue
+                started = datetime.fromisoformat(
+                    start_time.replace("Z", "+00:00")
+                )
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                duration = float(item["durationMinutes"])
+                if (started.timestamp() + duration * 60) > now.timestamp():
+                    active.append((started, item["contestName"]))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+        if not active:
+            raise ValueError(
+                f"No active training for game {game_slug}; the recipient must start the same challenge"
+            )
+        active.sort(key=lambda entry: entry[0], reverse=True)
+        return active[0][1]
 
     @staticmethod
     def _menu_markup():
@@ -490,8 +529,14 @@ class TelegramPoolBot:
                 if not isinstance(user, dict) or user.get("uuid") != job["target_uuid"]:
                     raise ValueError("Connected CCC account identity changed")
                 service = Service(client)
+                target_contest = await self._recipient_contest(client, job)
+                logger.info(
+                    "Resolved room queue contest job_id=%s game=%s source_contest=%s target_contest=%s target=CCC…%s",
+                    job["id"], job.get("game_slug") or "unknown", job["contest"],
+                    target_contest, target_suffix,
+                )
                 result = await service.submit(
-                    job["contest"], job["level"], job["file_id"],
+                    target_contest, job["level"], job["file_id"],
                     bytes(job["payload"]), job["filename"],
                 )
                 evaluation = result.get("evaluation") if isinstance(result, dict) else None
