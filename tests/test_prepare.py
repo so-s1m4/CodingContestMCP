@@ -5,6 +5,8 @@ import zipfile
 from pathlib import Path
 
 import httpx
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, NameObject
 from starlette.testclient import TestClient
 
 from ccc_mcp.app import create_app
@@ -159,3 +161,29 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(
                 artifacts.path(large["artifact_id"]).stat().st_size, 100000
             )
+
+    def test_pdf_preview_uses_last_four_pages_with_original_indices(self):
+        for page_count in (1, 2, 4, 7):
+            with self.subTest(page_count=page_count), tempfile.TemporaryDirectory() as root:
+                writer = PdfWriter()
+                for index in range(page_count):
+                    page = writer.add_blank_page(width=200, height=200)
+                    stream = DecodedStreamObject()
+                    stream.set_data(f"BT (Page {index}) Tj ET".encode())
+                    page[NameObject("/Contents")] = writer._add_object(stream)
+                pdf = io.BytesIO()
+                writer.write(pdf)
+                buffer = io.BytesIO()
+                with zipfile.ZipFile(buffer, "w") as archive:
+                    archive.writestr("statement.pdf", pdf.getvalue())
+                artifacts = Artifacts(Path(root), 200000)
+                stored = artifacts.save(buffer.getvalue(), "level.zip")
+                entry = artifacts.unpack(stored["artifact_id"], include_previews=True)["entries"][0]
+                preview = entry["pdf_preview"]
+                expected = list(range(max(0, page_count - 4), page_count))
+                self.assertEqual([page["page"] for page in preview["pages"]], expected)
+                self.assertEqual([page["text"] for page in preview["pages"]],
+                                 [f"Page {index}" for index in expected])
+                self.assertEqual(preview["total_pages"], page_count)
+                self.assertEqual(preview["truncated"], page_count > 4)
+                self.assertFalse(preview["needs_ocr"])

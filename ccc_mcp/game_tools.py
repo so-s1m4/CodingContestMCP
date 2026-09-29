@@ -382,7 +382,7 @@ async def game_info(contest: str):
 @tool(read_only=False)
 async def prepare_level(contest: str, level: int):
     """Get progress, inputFiles IDs, ZIP, extracted artifacts and bounded text previews in one call.
-    Small UTF-8 inputs are included whole; large inputs get a preview. PDF text from up to three pages
+    Small UTF-8 inputs are included whole; large inputs get a preview. PDF text from the last four pages (or all pages for shorter PDFs)
     is included when available. Use artifact tools for truncated data, diagrams or image-only PDFs."""
 
     async def run():

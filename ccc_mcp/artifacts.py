@@ -201,7 +201,7 @@ class Artifacts:
                         reader = PdfReader(stream)
                         pages = []
                         truncated = False
-                        for index in range(min(3, len(reader.pages))):
+                        for index in range(max(0, len(reader.pages) - 4), len(reader.pages)):
                             page_text = reader.pages[index].extract_text() or ""
                             preview = (
                                 page_text.encode("utf-8")[:remaining]
