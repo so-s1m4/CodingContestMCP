@@ -381,8 +381,9 @@ async def game_info(contest: str):
 
 @tool(read_only=False)
 async def prepare_level(contest: str, level: int):
-    """Get fresh progress, exact inputFiles IDs, level ZIP and extracted file artifact IDs in one call.
-    Then render PDF artifacts or read/download inputs. Does not start training or submit anything."""
+    """Get progress, inputFiles IDs, ZIP, extracted artifacts and bounded text previews in one call.
+    Small UTF-8 inputs are included whole; large inputs get a preview. PDF text from up to three pages
+    is included when available. Use artifact tools for truncated data, diagrams or image-only PDFs."""
 
     async def run():
         service = current_service()
@@ -393,7 +394,9 @@ async def prepare_level(contest: str, level: int):
                 contest, f"/api/contestant/level/{level}/files", f"level-{level}.zip"
             ),
         )
-        files = await local(lambda: service.artifacts.unpack(archive["artifact_id"]))
+        files = await local(
+            lambda: service.artifacts.unpack(archive["artifact_id"], include_previews=True)
+        )
         return {
             "contest": info["contest_slug"],
             "level": level,

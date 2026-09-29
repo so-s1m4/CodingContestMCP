@@ -154,7 +154,7 @@ class Artifacts:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
 
-    def unpack(self, artifact: str):
+    def unpack(self, artifact: str, include_previews: bool = False):
         entries = self.archive(artifact)
         files = [entry for entry in entries if not entry["directory"]]
         if len(files) > 100 or sum(entry["bytes"] for entry in files) > self.limit:
@@ -165,10 +165,62 @@ class Artifacts:
             }
         if len({entry["name"] for entry in files}) != len(files):
             raise ValueError("ZIP contains duplicate filenames")
-        return {
+        result = {
             "extracted": True,
             "entries": [self.member(artifact, entry["name"]) for entry in files],
         }
+        if include_previews:
+            self._add_previews(result["entries"])
+        return result
+
+    def _add_previews(self, entries):
+        """Put bounded, useful text beside artifact IDs to avoid extra MCP calls."""
+        remaining = 65536
+        text_suffixes = {".txt", ".in", ".csv", ".json", ".out", ".md"}
+        for entry in entries:
+            if remaining <= 0:
+                break
+            path = self.path(entry["artifact_id"])
+            suffix = Path(entry["filename"]).suffix.lower()
+            if suffix in text_suffixes:
+                limit = min(remaining, 32768 if entry["bytes"] <= 32768 else 4096)
+                with path.open("rb") as stream:
+                    chunk = stream.read(limit + 1)
+                if b"\0" in chunk:
+                    continue
+                content = chunk[:limit].decode("utf-8", errors="ignore")
+                entry["content_text"] = content
+                content_bytes = len(content.encode("utf-8"))
+                entry["content_truncated"] = (
+                    len(chunk) > limit or content_bytes < min(len(chunk), limit)
+                )
+                remaining -= content_bytes
+            elif suffix == ".pdf":
+                try:
+                    with path.open("rb") as stream:
+                        reader = PdfReader(stream)
+                        pages = []
+                        truncated = False
+                        for index in range(min(3, len(reader.pages))):
+                            page_text = reader.pages[index].extract_text() or ""
+                            preview = (
+                                page_text.encode("utf-8")[:remaining]
+                                .decode("utf-8", errors="ignore")
+                            )
+                            pages.append({"page": index, "text": preview})
+                            truncated |= len(preview) < len(page_text)
+                            remaining -= len(preview.encode("utf-8"))
+                            if remaining <= 0:
+                                break
+                        entry["pdf_preview"] = {
+                            "pages": pages,
+                            "total_pages": len(reader.pages),
+                            "needs_ocr": not any(page["text"].strip() for page in pages),
+                            "truncated": truncated or len(pages) < len(reader.pages),
+                        }
+                except Exception:
+                    # An unreadable PDF should remain available as an artifact.
+                    continue
 
     def pdf_text(self, artifact: str, page: int = 0):
         if page < 0:

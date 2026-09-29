@@ -100,6 +100,12 @@ class PrepareTests(unittest.TestCase):
             )
             self.assertTrue(data["files"]["extracted"])
             self.assertEqual(len(data["files"]["entries"]), 2)
+            small_input = next(
+                entry for entry in data["files"]["entries"]
+                if entry["filename"].endswith("small.txt")
+            )
+            self.assertEqual(small_input["content_text"], "5\nPR\nRR\nSS\nSR\nPS\n")
+            self.assertFalse(small_input["content_truncated"])
             artifact = data["archive"]["artifact_id"]
             calls.clear()
             downloaded = client.get(f"/mcp/artifacts/{artifact}", headers=headers)
@@ -135,3 +141,21 @@ class PrepareTests(unittest.TestCase):
                         ).read_bytes(),
                         b"xxxxx",
                     )
+
+    def test_previews_are_bounded_and_preserve_full_artifacts(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifacts = Artifacts(Path(root), 200000)
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("small.txt", b"answer\n")
+                archive.writestr("large.txt", b"x" * 100000)
+            stored = artifacts.save(buffer.getvalue(), "level.zip")
+            entries = artifacts.unpack(stored["artifact_id"], include_previews=True)["entries"]
+            small, large = entries
+            self.assertEqual(small["content_text"], "answer\n")
+            self.assertFalse(small["content_truncated"])
+            self.assertEqual(len(large["content_text"]), 4096)
+            self.assertTrue(large["content_truncated"])
+            self.assertEqual(
+                artifacts.path(large["artifact_id"]).stat().st_size, 100000
+            )
