@@ -16,6 +16,9 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from .contest_identity import notification_contest
+from .level_files import required_level_files
+
 RESEND_RETENTION_SECONDS = 30 * 24 * 60 * 60
 logger = logging.getLogger(__name__)
 
@@ -904,6 +907,8 @@ class SessionPools:
         game_slug: str | None = None,
         expected_files: list[str] | None = None,
     ):
+        if game_slug:
+            contest = notification_contest(contest)
         now = time.time()
         added = 0
         requeued = 0
@@ -924,7 +929,7 @@ class SessionPools:
                 connection.execute(
                     """INSERT INTO telegram_level_packs VALUES (?, ?, ?, ?)
                        ON CONFLICT(room, contest, level) DO UPDATE SET expected_files = excluded.expected_files""",
-                    (room, contest, level, json.dumps(list(dict.fromkeys(map(str, expected_files))))),
+                    (room, contest, level, json.dumps(required_level_files(expected_files))),
                 )
             for (target_uuid,) in members:
                 cursor = connection.execute(
@@ -987,7 +992,7 @@ class SessionPools:
         ).fetchone()
         if not pack:
             return False
-        expected = set(json.loads(pack[0]))
+        expected = set(required_level_files(json.loads(pack[0])))
         available = {row[0] for row in connection.execute(
             """SELECT file_id FROM telegram_fanout_queue
                WHERE room = ? AND contest = ? AND level = ? AND target_uuid = ?""",

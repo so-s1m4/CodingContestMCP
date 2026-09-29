@@ -48,6 +48,35 @@ class UploadConsentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["target_uuid"], "target")
         self.assertIsNone(self.pools.claim_due())
 
+    def test_training_instance_ids_share_one_offer(self):
+        contest = "training_ccc_2024_04_classic_lawn_mower_65883_2b26f9ac"
+        other = "training_ccc_2024_04_classic_lawn_mower_99999_deadbeef"
+        self.pools.enqueue_fanout("room", "source", contest, 5, "1", "out.txt", b"answer",
+                                  game_slug="classic-lawn-mower", expected_files=["1"])
+        self.pools.enqueue_fanout("room", "source", other, 5, "1", "out.txt", b"answer",
+                                  game_slug="classic-lawn-mower", expected_files=["1"])
+        with sqlite3.connect(self.pools.database) as connection:
+            contests = connection.execute("SELECT DISTINCT contest FROM telegram_fanout_queue").fetchall()
+        self.assertEqual(contests, [("training-ccc-2024-04-classic-lawn-mower",)])
+        self.assertEqual(self.offer_for("2")["files"], 1)
+
+    def test_example_is_not_required_for_pack_including_saved_manifest(self):
+        self.expected_files = ["example", "1", "2"]
+        self.enqueue("1")
+        self.assertIsNone(self.pools.next_upload_offer())
+        self.enqueue("2")
+        # Simulate a manifest saved before examples were excluded.
+        with sqlite3.connect(self.pools.database) as connection:
+            connection.execute(
+                "UPDATE telegram_level_packs SET expected_files = ?",
+                ('["example", "1", "2"]',),
+            )
+        offer = self.offer_for("2")
+        self.assertEqual(offer["files"], 2)
+        self.assertIsNone(self.pools.claim_due())
+        self.assertEqual(self.pools.answer_upload_offer(offer["id"], "2", True), 2)
+        self.assertIsNotNone(self.pools.claim_due())
+
     def test_unknown_manifest_does_not_offer_partial_pack(self):
         self.expected_files = None
         self.enqueue()

@@ -17,12 +17,16 @@ import httpx
 from mcp.types import ImageContent
 
 from .context import current_account_uuid, current_service, current_session_pools, current_team_room
+from .contest_identity import notification_contest
 from .download_links import download_links
+from .level_files import required_level_files
 from .service import compact_progress, contest_slug, segment
 from .telegram_state import (
     claim_solution,
     get_progress_message,
     get_solution_batch,
+    normalize_solution_contests,
+    record_first_blood,
     save_solution_batch,
     save_progress_message,
     save_solution_payload,
@@ -44,7 +48,7 @@ async def _notify_telegram_solution(
         return "disabled: configure BOT_TOKEN and BOT_CHAT_ID on the MCP server"
 
     database = settings.bot_dedupe_db or settings.data_dir / "telegram-sent.sqlite3"
-    slug = contest_slug(contest)
+    slug = notification_contest(contest_slug(contest))
     def tag(value):
         safe = "".join(char if char.isalnum() or char == "_" else "_" for char in value)
         return safe.strip("_") or "unknown"
@@ -53,6 +57,7 @@ async def _notify_telegram_solution(
     lock = _telegram_batch_locks.setdefault(lock_key, asyncio.Lock())
     async with lock:
         try:
+            await local(lambda: normalize_solution_contests(database))
             claimed = await local(
                 lambda: claim_solution(database, slug, level, str(file_id))
             )
@@ -64,13 +69,7 @@ async def _notify_telegram_solution(
                 )
             )
             batch = await local(lambda: get_solution_batch(database, slug, level))
-            expected_files = list(
-                dict.fromkeys(
-                    str(item)
-                    for item in batch["expected_files"]
-                    if isinstance(item, (str, int))
-                )
-            )
+            expected_files = required_level_files(batch["expected_files"])
             if not expected_files:
                 try:
                     info = await service.info(contest)
@@ -82,12 +81,7 @@ async def _notify_telegram_solution(
                         ),
                         {},
                     )
-                    expected_files = [
-                        str(item)
-                        for item in level_info.get("inputFiles", [])
-                        if isinstance(item, (str, int))
-                    ]
-                    expected_files = list(dict.fromkeys(expected_files))
+                    expected_files = required_level_files(level_info.get("inputFiles", []))
                 except Exception as error:
                     logger.info(
                         "Could not load expected Telegram batch files: %s",
@@ -578,6 +572,38 @@ async def process_accepted_solution(service, pools, team_room, contest, level, f
         if not isinstance(account_uuid, str) or not account_uuid:
             raise ValueError("Could not verify the submitting CCC account")
         source_suffix = account_uuid[-6:]
+        try:
+            info = await service.info(contest)
+            level_info = next(
+                (item for item in info.get("levels", []) if item.get("level") == level), {}
+            )
+            required = required_level_files(level_info.get("inputFiles", []))
+            if required:
+                label = next(
+                    (account[key] for key in ("username", "displayName", "name", "email")
+                     if isinstance(account.get(key), str) and account[key].strip()),
+                    f"CCC…{source_suffix}",
+                )
+                database = (service.client.settings.bot_dedupe_db
+                            or service.client.settings.data_dir / "telegram-sent.sqlite3")
+                _, won = await local(lambda: record_first_blood(
+                    database, notification_contest(contest_slug(contest)), level,
+                    str(file_id), required, account_uuid, label[:80],
+                ))
+                if won and service.client.settings.bot_token and service.client.settings.bot_chat_id:
+                    async with (
+                        nullcontext(service.telegram_client)
+                        if hasattr(service, "telegram_client")
+                        else httpx.AsyncClient(timeout=service.client.settings.timeout)
+                    ) as telegram:
+                        response = await telegram.post(
+                            f"https://api.telegram.org/bot{service.client.settings.bot_token}/sendMessage",
+                            json={"chat_id": service.client.settings.bot_chat_id,
+                                  "text": f"🩸 FIRST_BLOOD · {notification_contest(contest_slug(contest))} · Level {level}\nПервым решил: {label[:80]}"},
+                        )
+                        response.raise_for_status()
+        except Exception as error:
+            logger.warning("Could not record or announce FIRST_BLOOD (%s)", type(error).__name__)
         game_slug = None
         source_contest = contest_slug(contest)
         try:
@@ -694,7 +720,7 @@ async def process_accepted_solution(service, pools, team_room, contest, level, f
                     (item.get("inputFiles", []) for item in info.get("levels", [])
                      if item.get("level") == level), []
                 )
-                expected_files = [str(item) for item in expected_files if isinstance(item, (str, int))]
+                expected_files = required_level_files(expected_files)
             except Exception as error:
                 logger.warning("Could not load level pack manifest (%s)", type(error).__name__)
             fanout = await local(

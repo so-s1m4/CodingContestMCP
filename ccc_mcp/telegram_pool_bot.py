@@ -16,6 +16,7 @@ import httpx
 
 from .client import CCCClient
 from .config import Settings
+from .contest_identity import notification_contest
 from .service import Service
 from .session_pools import SessionPools
 
@@ -348,7 +349,7 @@ class TelegramPoolBot:
                 )
                 lines.append(
                     f"• #{item['job_id']} · {label} · CCC…{account_suffix}\n"
-                    f"  {item['contest']} · уровень {item['level']} · файл {item['file_id']} ·{status_text}"
+                    f"  {notification_contest(item['contest'])} · уровень {item['level']} · файл {item['file_id']} ·{status_text}"
                 )
             await self._send(
                 chat_id,
@@ -692,12 +693,11 @@ class TelegramPoolBot:
     def _game_label(game):
         slug = game.get("game_slug")
         if not isinstance(slug, str) or not slug:
-            return game["contest"]
+            return notification_contest(game["contest"])
         display = slug.removeprefix("training-").removeprefix("ccc-")
         display = re.sub(r"^\d{4}[-._]\d{1,2}[-._]", "", display)
         display = display.removeprefix("school-").replace("-", " ").title()
-        suffix = game["contest"].rsplit("-", 1)[-1]
-        return f"{display} · {suffix}"
+        return display
 
     async def _render_replay_games(self, chat_id: int, flow_id: str):
         flow = self.replay_flows[flow_id]
@@ -927,7 +927,7 @@ class TelegramPoolBot:
                 )
                 lines.append(
                     f"• #{item['job_id']} · {label} · CCC…{account_suffix} · {status}\n"
-                    f"  {item['contest']} · уровень {item['level']} · файл {item['file_id']}"
+                    f"  {notification_contest(item['contest'])} · уровень {item['level']} · файл {item['file_id']}"
                 )
                 keyboard_rows.append(
                     [{
@@ -949,7 +949,7 @@ class TelegramPoolBot:
         await self._telegram(
             "sendMessage", chat_id=offer["telegram_user_id"],
             text=(
-                f"Хотите загрузить {offer['contest']} — уровень {offer['level']} "
+                f"Хотите загрузить {notification_contest(offer['contest'])} — уровень {offer['level']} "
                 f"от своего имени целым паком?\nКомната: {offer['room']}. "
                 f"Пак уровня готов. Файлов к загрузке: {offer['files']}."
             ),

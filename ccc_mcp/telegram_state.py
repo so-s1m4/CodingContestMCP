@@ -229,6 +229,7 @@ def clear_solution_state(database: Path):
 
 def solution_progress(database: Path):
     """Summarize currently retained accepted outputs for the Telegram status message."""
+    from .level_files import required_level_files
     with sqlite3.connect(database, timeout=30) as connection:
         connection.execute(
             """CREATE TABLE IF NOT EXISTS telegram_solution_payloads (
@@ -252,7 +253,8 @@ def solution_progress(database: Path):
         ).fetchall()
     accepted = {}
     for contest, level, file_id in rows:
-        accepted.setdefault((contest, level), set()).add(file_id)
+        if required_level_files([file_id]):
+            accepted.setdefault((contest, level), set()).add(file_id)
     expected = {}
     for contest, level, raw in expected_rows:
         try:
@@ -260,9 +262,7 @@ def solution_progress(database: Path):
         except (TypeError, ValueError):
             values = []
         if isinstance(values, list):
-            expected[(contest, level)] = {
-                str(value) for value in values if isinstance(value, (str, int))
-            }
+            expected[(contest, level)] = set(required_level_files(values))
     keys = sorted(set(accepted) | set(expected))
     return [
         {
@@ -346,3 +346,74 @@ def save_solution_batch(
                 json.dumps(expected_files) if expected_files else None,
             ),
         )
+
+
+def normalize_solution_contests(database: Path):
+    """Merge old instance keys, retaining a sent message and existing payload paths."""
+    from .contest_identity import notification_contest
+
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(database, timeout=30) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        for table in ("telegram_solutions", "telegram_solution_payloads", "telegram_solution_batches"):
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone():
+                continue
+            columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
+            for row in connection.execute(f"SELECT * FROM {table}").fetchall():
+                old = row[columns.index("contest")]
+                canonical = notification_contest(old)
+                if canonical == old:
+                    continue
+                values = list(row)
+                values[columns.index("contest")] = canonical
+                connection.execute(
+                    f"INSERT OR IGNORE INTO {table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                    values,
+                )
+                if table == "telegram_solution_batches":
+                    connection.execute(
+                        """UPDATE telegram_solution_batches SET
+                           message_id=COALESCE(message_id, ?), expected_files=COALESCE(expected_files, ?)
+                           WHERE contest=? AND level=?""",
+                        (row[columns.index("message_id")], row[columns.index("expected_files")], canonical, row[columns.index("level")]),
+                    )
+                connection.execute(f"DELETE FROM {table} WHERE contest=?", (old,))
+
+
+def record_first_blood(database, contest, level, file_id, expected_files, account_uuid, label):
+    """Track each account separately and atomically retain the first complete solver."""
+    from .level_files import required_level_files
+
+    expected = set(required_level_files(expected_files))
+    with sqlite3.connect(database, timeout=30) as connection:
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS telegram_solver_files (
+                contest TEXT NOT NULL, level INTEGER NOT NULL, account_uuid TEXT NOT NULL,
+                file_id TEXT NOT NULL, PRIMARY KEY(contest, level, account_uuid, file_id)
+            );
+            CREATE TABLE IF NOT EXISTS telegram_first_blood (
+                contest TEXT NOT NULL, level INTEGER NOT NULL, account_uuid TEXT NOT NULL,
+                label TEXT NOT NULL, solved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(contest, level)
+            );
+        """)
+        connection.execute("BEGIN IMMEDIATE")
+        won = False
+        if account_uuid and file_id in expected:
+            connection.execute("INSERT OR IGNORE INTO telegram_solver_files VALUES (?, ?, ?, ?)",
+                               (contest, level, account_uuid, file_id))
+            accepted = {row[0] for row in connection.execute(
+                "SELECT file_id FROM telegram_solver_files WHERE contest=? AND level=? AND account_uuid=?",
+                (contest, level, account_uuid),
+            )}
+            if expected and expected <= accepted:
+                won = connection.execute(
+                    "INSERT OR IGNORE INTO telegram_first_blood (contest, level, account_uuid, label) VALUES (?, ?, ?, ?)",
+                    (contest, level, account_uuid, label),
+                ).rowcount == 1
+        row = connection.execute(
+            "SELECT label FROM telegram_first_blood WHERE contest=? AND level=?", (contest, level)
+        ).fetchone()
+        return (row[0] if row else None), won
