@@ -7,19 +7,22 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 import traceback
 import uuid
 from dataclasses import replace
 from urllib.parse import parse_qs
+from urllib.request import getproxies
 
 import httpx
 import uvicorn
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 
-from . import game_tools  # noqa: F401 -- registers game tools
-from .client import APIError, CCCClient
+from . import game_tools
+from .client import APIError, CCCClient, SharedTransport
 from .context import (
     account_service,
+    account_uuid as account_uuid_context,
     session_pools as session_pools_context,
     team_room as team_room_context,
 )
@@ -45,27 +48,53 @@ class AccountMiddleware:
             self.settings.bot_session_encryption_key,
         )
         self.telegram_task = None
+        self.maintenance_task = None
+        self.post_submit_task = None
+        self.startup_notice_task = None
+        self.http_transport = httpx.AsyncHTTPTransport()
+        proxy_url = getproxies().get("https") or getproxies().get("all")
+        self.proxy_transport = (
+            httpx.AsyncHTTPTransport(proxy=proxy_url) if proxy_url else None
+        )
+        self.shared_transport = SharedTransport(self.http_transport, self.proxy_transport)
+        self.telegram_http = httpx.AsyncClient(timeout=min(self.settings.timeout, 35))
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
             async def receive_with_bot_shutdown():
                 message = await receive()
-                if message["type"] == "lifespan.shutdown" and self.telegram_task:
-                    self.telegram_task.cancel()
-                    try:
-                        await self.telegram_task
-                    except asyncio.CancelledError:
-                        pass
+                if message["type"] == "lifespan.shutdown":
+                    for task in (
+                        self.telegram_task, self.maintenance_task,
+                        self.post_submit_task, self.startup_notice_task,
+                    ):
+                        if task:
+                            task.cancel()
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                pass
+                    await self.http_transport.aclose()
+                    if self.proxy_transport is not None:
+                        await self.proxy_transport.aclose()
+                    await self.telegram_http.aclose()
                 return message
 
             async def send_with_startup_notice(message):
                 if message["type"] == "lifespan.startup.complete":
-                    await self.reset_progress_on_startup()
+                    message_ids = await self.reset_progress_on_startup()
+                    self.maintenance_task = asyncio.create_task(
+                        self.finish_startup_reset(message_ids)
+                    )
+                    self.post_submit_task = asyncio.create_task(self.process_accepted_solutions())
                     if self.settings.bot_token:
                         self.telegram_task = asyncio.create_task(
-                            TelegramPoolBot(self.settings, self.session_pools).run()
+                            TelegramPoolBot(
+                                self.settings, self.session_pools, self.shared_transport,
+                                self.telegram_http,
+                            ).run()
                         )
-                    await self.notify_startup()
+                    self.startup_notice_task = asyncio.create_task(self.notify_startup())
                 await send(message)
 
             return await self.app(
@@ -138,8 +167,11 @@ class AccountMiddleware:
                 scope, receive, send, 400, "Invalid X-CCC-Team-Room value"
             )
 
-        client = self.client_factory(
-            replace(self.settings, cookie="", session=values[0].decode("ascii"))
+        account_settings = replace(self.settings, cookie="", session=values[0].decode("ascii"))
+        client = (
+            self.client_factory(account_settings, transport=self.shared_transport)
+            if self.client_factory is CCCClient
+            else self.client_factory(account_settings)
         )
         try:
             try:
@@ -306,9 +338,11 @@ class AccountMiddleware:
                     context_token = account_service.set(service)
                     room_token = team_room_context.set(room_name)
                     pools_token = session_pools_context.set(self.session_pools)
+                    uuid_token = account_uuid_context.set(user["uuid"])
                     try:
                         await self.app(scope, receive, send)
                     finally:
+                        account_uuid_context.reset(uuid_token)
                         session_pools_context.reset(pools_token)
                         team_room_context.reset(room_token)
                         account_service.reset(context_token)
@@ -331,14 +365,14 @@ class AccountMiddleware:
             )
             return
         try:
-            async with httpx.AsyncClient(timeout=min(self.settings.timeout, 10)) as client:
-                response = await client.post(
+            response = await self.telegram_http.post(
                     f"https://api.telegram.org/bot{self.settings.bot_token}/sendMessage",
                     json={
                         "chat_id": self.settings.bot_chat_id,
                         "text": "✅ CodingContest MCP успешно запущен.",
                     },
-                )
+                    timeout=min(self.settings.timeout, 10),
+            )
             body = response.json()
             if response.is_success and isinstance(body, dict) and body.get("ok") is True:
                 logger.info("Startup Telegram notification sent")
@@ -384,52 +418,100 @@ class AccountMiddleware:
                 path.unlink(missing_ok=True)
                 removed_artifacts += 1
 
+        logger.info(
+            "MCP startup reset; cleared solution progress, %s fanout queue/history entries, %s Telegram message references and %s local artifacts; room/session database preserved at %s",
+            cleared_queue, len(message_ids), removed_artifacts,
+            self.settings.data_dir / "telegram-pools.sqlite3",
+        )
+        return message_ids
+
+    async def finish_startup_reset(self, message_ids):
         if message_ids and self.settings.bot_token and self.settings.bot_chat_id:
-            async with httpx.AsyncClient(timeout=min(self.settings.timeout, 15)) as client:
-                for message_id in message_ids:
+            limit = asyncio.Semaphore(4)
+
+            async def delete_one(message_id):
+                async with limit:
                     try:
-                        response = await client.post(
+                        response = await self.telegram_http.post(
                             f"https://api.telegram.org/bot{self.settings.bot_token}/deleteMessage",
-                            json={
-                                "chat_id": self.settings.bot_chat_id,
-                                "message_id": message_id,
-                            },
+                            json={"chat_id": self.settings.bot_chat_id, "message_id": message_id},
+                            timeout=min(self.settings.timeout, 15),
                         )
                         body = response.json()
-                        if not (
-                            response.is_success
-                            and isinstance(body, dict)
-                            and body.get("ok") is True
-                        ):
-                            description = (
-                                body.get("description")
-                                if isinstance(body, dict)
-                                else None
-                            )
+                        if not (response.is_success and isinstance(body, dict) and body.get("ok") is True):
+                            description = body.get("description") if isinstance(body, dict) else None
                             logger.warning(
                                 "Could not remove old Telegram solution message id=%s (HTTP %s): %s",
-                                message_id,
-                                response.status_code,
+                                message_id, response.status_code,
                                 description if isinstance(description, str) else "unknown error",
                             )
                     except (httpx.HTTPError, ValueError) as error:
                         logger.warning(
                             "Could not remove old Telegram solution message id=%s (%s)",
-                            message_id,
-                            type(error).__name__,
+                            message_id, type(error).__name__,
                         )
+
+            await asyncio.gather(*(delete_one(message_id) for message_id in message_ids))
         elif message_ids:
             logger.warning(
                 "Skipped deletion of %s old Telegram solution messages: BOT_TOKEN or BOT_CHAT_ID is missing",
                 len(message_ids),
             )
 
-        await game_tools.update_telegram_progress(self.settings, reset=True)
-        logger.info(
-            "MCP startup reset; cleared solution progress, %s fanout queue/history entries, %s Telegram message references and %s local artifacts; room/session database preserved at %s",
-            cleared_queue, len(message_ids), removed_artifacts,
-            self.settings.data_dir / "telegram-pools.sqlite3",
-        )
+        await game_tools.update_telegram_progress(self.settings, reset=True, client=self.telegram_http)
+
+    async def process_accepted_solutions(self):
+        if self.maintenance_task:
+            try:
+                await self.maintenance_task
+            except Exception as error:
+                logger.error("Startup Telegram cleanup failed (%s)", type(error).__name__)
+        last_recovery = 0.0
+        while True:
+            job = None
+            try:
+                if time.monotonic() - last_recovery >= 30:
+                    await asyncio.to_thread(self.session_pools.recover_accepted_solutions)
+                    last_recovery = time.monotonic()
+                job = await asyncio.to_thread(self.session_pools.claim_accepted_solution)
+                if job is None:
+                    await asyncio.sleep(0.5)
+                    continue
+                session = self.session_pools.queue_fernet.decrypt(job["session_cipher"]).decode()
+                account_dir = self.settings.data_dir / "accounts" / hashlib.sha256(
+                    job["account_uuid"].encode()
+                ).hexdigest()
+                configured = replace(
+                    self.settings, cookie="", session=session, data_dir=account_dir,
+                    bot_dedupe_db=self.settings.bot_dedupe_db
+                    or self.settings.data_dir / "telegram-sent.sqlite3",
+                )
+                client = CCCClient(configured, transport=self.shared_transport)
+                try:
+                    service = Service(client)
+                    service.telegram_client = self.telegram_http
+                    delivery = await game_tools.process_accepted_solution(
+                        service, self.session_pools, job["room"], job["contest"],
+                        job["level"], job["file_id"], job["filename"], bytes(job["payload"]),
+                    )
+                    await asyncio.to_thread(
+                        self.session_pools.finish_accepted_solution, job["id"], "done",
+                        delivery.get("telegram_notification"), delivery.get("team_fanout"),
+                    )
+                finally:
+                    await client.close()
+            except asyncio.CancelledError:
+                if job is not None:
+                    await asyncio.to_thread(self.session_pools.requeue_accepted_solution, job["id"])
+                raise
+            except Exception as error:
+                logger.error("Accepted-solution worker failed (%s)", type(error).__name__)
+                if job is not None:
+                    await asyncio.to_thread(
+                        self.session_pools.finish_accepted_solution, job["id"], "failed",
+                        detail=type(error).__name__,
+                    )
+                await asyncio.sleep(2)
 
     async def enroll_telegram_session(self, scope, receive, send, token):
         headers = {key.lower(): value for key, value in scope.get("headers", [])}

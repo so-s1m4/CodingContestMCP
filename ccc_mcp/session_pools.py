@@ -6,8 +6,10 @@ import hashlib
 import hmac
 import logging
 import os
+import random
 import secrets
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 
@@ -22,6 +24,23 @@ class SessionPools:
         self.database = database
         self.fernet = Fernet(encryption_key.encode()) if encryption_key else None
         self.database.parent.mkdir(parents=True, exist_ok=True)
+        key_path = self.database.with_suffix(".queue-key")
+        if not key_path.exists():
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=self.database.parent, delete=False) as key_file:
+                    temporary = Path(key_file.name)
+                    os.chmod(temporary, 0o600)
+                    key_file.write(Fernet.generate_key())
+                    key_file.flush()
+                    os.fsync(key_file.fileno())
+                os.link(temporary, key_path)
+            except FileExistsError:
+                pass
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        self.queue_fernet = Fernet(key_path.read_bytes())
         with sqlite3.connect(self.database) as connection:
             connection.executescript(
                 """
@@ -70,6 +89,25 @@ class SessionPools:
                 );
                 CREATE INDEX IF NOT EXISTS telegram_fanout_due
                     ON telegram_fanout_queue(status, run_after);
+                CREATE TABLE IF NOT EXISTS accepted_solution_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_uuid TEXT NOT NULL,
+                    session_cipher BLOB NOT NULL,
+                    contest TEXT NOT NULL,
+                    level INTEGER NOT NULL,
+                    file_id TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    payload BLOB NOT NULL,
+                    room TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    telegram_status TEXT,
+                    fanout_status TEXT,
+                    detail TEXT,
+                    claimed_at REAL,
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS accepted_solution_due
+                    ON accepted_solution_queue(status, id);
                 CREATE TABLE IF NOT EXISTS telegram_target_cooldowns (
                     room TEXT NOT NULL,
                     account_uuid TEXT NOT NULL,
@@ -116,6 +154,75 @@ class SessionPools:
                 (time.time() - RESEND_RETENTION_SECONDS,),
             )
         self.recover_stale_jobs()
+        self.recover_accepted_solutions()
+
+    def enqueue_accepted_solution(self, account_uuid, session, contest, level,
+                                  file_id, filename, payload, room):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            cursor = connection.execute(
+                """INSERT INTO accepted_solution_queue
+                   (account_uuid, session_cipher, contest, level, file_id, filename,
+                    payload, room, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (account_uuid, self.queue_fernet.encrypt(session.encode()), contest,
+                 level, str(file_id), filename, payload, room, time.time()),
+            )
+            return cursor.lastrowid
+
+    def claim_accepted_solution(self):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM accepted_solution_queue WHERE status = 'queued' ORDER BY id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE accepted_solution_queue SET status = 'working', claimed_at = ? WHERE id = ?",
+                (time.time(), row["id"]),
+            )
+            return dict(row)
+
+    def finish_accepted_solution(self, job_id, status, telegram_status=None,
+                                 fanout_status=None, detail=None):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.execute(
+                """UPDATE accepted_solution_queue SET status = ?, telegram_status = ?,
+                   fanout_status = ?, detail = ?, payload = X'', session_cipher = X'',
+                   claimed_at = NULL WHERE id = ?""",
+                (status, telegram_status, fanout_status, detail, job_id),
+            )
+
+    def accepted_solution_status(self, job_id, account_uuid):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """SELECT id, status, telegram_status, fanout_status, detail
+                   FROM accepted_solution_queue WHERE id = ? AND account_uuid = ?""",
+                (job_id, account_uuid),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def recover_accepted_solutions(self, stale_after=600):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.execute(
+                """DELETE FROM accepted_solution_queue
+                   WHERE status IN ('done', 'failed') AND created_at < ?""",
+                (time.time() - RESEND_RETENTION_SECONDS,),
+            )
+            return connection.execute(
+                """UPDATE accepted_solution_queue SET status = 'queued', claimed_at = NULL
+                   WHERE status = 'working' AND claimed_at <= ?""",
+                (time.time() - stale_after,),
+            ).rowcount
+
+    def requeue_accepted_solution(self, job_id):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.execute(
+                """UPDATE accepted_solution_queue SET status = 'queued', claimed_at = NULL
+                   WHERE id = ? AND status = 'working'""",
+                (job_id,),
+            )
 
     def deployment_instance_changed(self, instance_id: str) -> bool:
         """Check the container identity without mixing it with room/session state."""
@@ -406,13 +513,17 @@ class SessionPools:
             rows = connection.execute(
                 """SELECT q.id, q.contest, q.level, q.file_id, q.target_uuid,
                           m.telegram_label, m.telegram_user_id,
-                          q.run_after,
+                          MAX(q.run_after, COALESCE((
+                              SELECT MAX(c.next_send_at)
+                              FROM telegram_target_cooldowns c
+                              WHERE c.account_uuid = q.target_uuid
+                          ), 0)),
                           q.status
                    FROM telegram_fanout_queue q
                    JOIN telegram_room_members m
                      ON m.room = q.room AND m.account_uuid = q.target_uuid
                    WHERE q.room = ? AND q.status IN ('queued', 'sending')
-                   ORDER BY 8, q.id""",
+                   ORDER BY q.manual DESC, 8, q.id""",
                 (room,),
             ).fetchall()
         return [
@@ -836,8 +947,17 @@ class SessionPools:
                 """SELECT q.*, m.session_cipher FROM telegram_fanout_queue q
                    JOIN telegram_room_members m
                      ON m.room = q.room AND m.account_uuid = q.target_uuid
-                   WHERE q.status = 'queued'
-                   ORDER BY q.id LIMIT 1""",
+                   WHERE q.status = 'queued' AND q.run_after <= ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM telegram_target_cooldowns c
+                         WHERE c.account_uuid = q.target_uuid AND c.next_send_at > ?
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM telegram_fanout_queue active
+                         WHERE active.target_uuid = q.target_uuid AND active.status = 'sending'
+                     )
+                   ORDER BY q.manual DESC, q.run_after, q.id LIMIT 1""",
+                (time.time(), time.time()),
             ).fetchone()
             if row is None:
                 return None
@@ -858,8 +978,20 @@ class SessionPools:
 
     def finish_job(self, job_id: int, status: str, detail: str | None = None):
         with sqlite3.connect(self.database, timeout=30) as connection:
+            row = connection.execute(
+                "SELECT room, target_uuid FROM telegram_fanout_queue WHERE id = ? AND status = 'sending'",
+                (job_id,),
+            ).fetchone()
             connection.execute(
                 """UPDATE telegram_fanout_queue
                    SET status = ?, detail = ?, claimed_at = NULL WHERE id = ?""",
                 (status, detail, job_id),
             )
+            if row:
+                connection.execute(
+                    """INSERT INTO telegram_target_cooldowns (room, account_uuid, next_send_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(room, account_uuid) DO UPDATE SET
+                         next_send_at = MAX(next_send_at, excluded.next_send_at)""",
+                    (row[0], row[1], time.time() + random.randint(60, 180)),
+                )

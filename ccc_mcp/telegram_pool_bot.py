@@ -31,7 +31,7 @@ def _safe_error_text(error: BaseException, secrets=()) -> str:
 
 
 class TelegramPoolBot:
-    def __init__(self, settings: Settings, pools: SessionPools):
+    def __init__(self, settings: Settings, pools: SessionPools, transport=None, telegram_client=None):
         self.settings = settings
         self.pools = pools
         self.base = f"https://api.telegram.org/bot{settings.bot_token}"
@@ -41,6 +41,9 @@ class TelegramPoolBot:
         self.replay_flows = {}
         self.self_replay_flows = {}
         self.queue_wakeup = asyncio.Event()
+        self.transport = transport
+        self.owns_telegram_client = telegram_client is None
+        self.telegram_client = telegram_client or httpx.AsyncClient(timeout=min(settings.timeout, 35))
 
     async def _recipient_contest(self, client: CCCClient, job) -> str:
         game_slug = job.get("game_slug")
@@ -119,13 +122,12 @@ class TelegramPoolBot:
         }
 
     async def _telegram(self, method: str, **kwargs):
-        async with httpx.AsyncClient(timeout=min(self.settings.timeout, 35)) as client:
-            response = await client.post(f"{self.base}/{method}", json=kwargs)
-            response.raise_for_status()
-            body = response.json()
-            if not isinstance(body, dict) or body.get("ok") is not True:
-                raise ValueError("Telegram Bot API rejected the request")
-            return body.get("result")
+        response = await self.telegram_client.post(f"{self.base}/{method}", json=kwargs)
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            raise ValueError("Telegram Bot API rejected the request")
+        return body.get("result")
 
     async def _send(
         self, chat_id: int, text: str, reply_markup=None, replace_previous=True
@@ -336,7 +338,11 @@ class TelegramPoolBot:
                 status_text = (
                     "  отправляется сейчас"
                     if item["status"] == "sending"
-                    else "  ожидает отправки"
+                    else (
+                        f"  через {max(0, int(item['due_at'] - time.time()))} с"
+                        if item["due_at"] > time.time()
+                        else "  ожидает отправки"
+                    )
                 )
                 lines.append(
                     f"• #{item['job_id']} · {label} · CCC…{account_suffix}\n"
@@ -926,7 +932,7 @@ class TelegramPoolBot:
         session = None
         try:
             session = self.pools.decrypt_session(job["session_cipher"])
-            client = CCCClient(replace(self.settings, cookie="", session=session))
+            client = CCCClient(replace(self.settings, cookie="", session=session), transport=self.transport)
             try:
                 user = await client.json("GET", "/api/auth/current-user")
                 if not isinstance(user, dict) or user.get("uuid") != job["target_uuid"]:
@@ -978,12 +984,12 @@ class TelegramPoolBot:
             )
         return True
 
-    async def _queue_loop(self):
+    async def _queue_loop(self, recover=False):
         last_recovery = 0.0
         while True:
             try:
                 now = time.monotonic()
-                if now - last_recovery >= 30:
+                if recover and now - last_recovery >= 30:
                     await asyncio.to_thread(self.pools.recover_stale_jobs)
                     last_recovery = now
                 delivered = await self._deliver_one()
@@ -1026,4 +1032,11 @@ class TelegramPoolBot:
                 "".join(traceback.format_tb(error.__traceback__)),
             )
         logger.info("Telegram pool bot polling and room queue workers started")
-        await asyncio.gather(self._poll_loop(), self._queue_loop())
+        try:
+            await asyncio.gather(
+                self._poll_loop(), self._queue_loop(recover=True),
+                *(self._queue_loop() for _ in range(3)),
+            )
+        finally:
+            if self.owns_telegram_client:
+                await self.telegram_client.aclose()

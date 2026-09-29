@@ -11,6 +11,11 @@ if TYPE_CHECKING:
 account_service: ContextVar[Service] = ContextVar("ccc_account_service")
 team_room: ContextVar[str | None] = ContextVar("ccc_team_room", default=None)
 session_pools: ContextVar["SessionPools"] = ContextVar("ccc_session_pools")
+account_uuid: ContextVar[str | None] = ContextVar("ccc_account_uuid", default=None)
+
+
+def current_account_uuid() -> str | None:
+    return account_uuid.get()
 
 
 def current_service() -> Service:

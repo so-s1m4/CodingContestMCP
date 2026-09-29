@@ -2,8 +2,10 @@
 
 import asyncio
 import math
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 from .artifacts import Artifacts
@@ -176,11 +178,12 @@ class Service:
             )
 
     async def info(self, contest):
-        metadata = (await self.request(contest, "GET", "/game/game-info")).json()
-        progress = (
-            await self.request(contest, "GET", "/api/contestant/contestant-info")
-        ).json()
         game = await self.session(contest)
+        metadata_response, progress_response = await asyncio.gather(
+            self.request(contest, "GET", "/game/game-info"),
+            self.request(contest, "GET", "/api/contestant/contestant-info"),
+        )
+        metadata, progress = metadata_response.json(), progress_response.json()
         unlocked = ((progress.get("score") or {}).get("gameScore") or {}).get("level")
         levels = [
             {
@@ -219,16 +222,46 @@ class Service:
             segment(file_id)
 
     async def asset(self, contest, path, filename):
-        response = await self.request(contest, "GET", path)
-        if "json" in response.headers.get("content-type", ""):
-            # The frontend's documented fallback avoids leaking tokens to signed URLs.
-            response = await self.request(contest, "GET", path, params={"raw": "true"})
-            if "json" in response.headers.get("content-type", ""):
-                raise ValueError("Raw asset endpoint returned JSON instead of a file")
-        return await asyncio.to_thread(self.artifacts.save, response.content, filename)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=self.artifacts.root, delete=False) as output:
+                temporary = Path(output.name)
+                response = await self.request(contest, "GET", path, output=output)
+                if "json" in response.headers.get("content-type", ""):
+                    # The frontend's fallback avoids exposing the game token to signed URLs.
+                    response = await self.request(
+                        contest, "GET", path, params={"raw": "true"}, output=output
+                    )
+                    if "json" in response.headers.get("content-type", ""):
+                        raise ValueError("Raw asset endpoint returned JSON instead of a file")
+            result = await asyncio.to_thread(self.artifacts.adopt, temporary, filename)
+            temporary = None
+            return result
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    async def response_file(self, method, path, filename, *, contest=None, **kwargs):
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=self.artifacts.root, delete=False) as output:
+                temporary = Path(output.name)
+                if contest is None:
+                    response = await self.client.request(method, path, output=output, **kwargs)
+                else:
+                    response = await self.request(contest, method, path, output=output, **kwargs)
+                if response.content:
+                    output.write(response.content)
+            result = await asyncio.to_thread(self.artifacts.adopt, temporary, filename)
+            temporary = None
+            return result
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     async def submit(self, contest, level, file_id, payload, filename):
-        if len(payload) > self.client.settings.max_bytes:
+        size = payload.stat().st_size if isinstance(payload, Path) else len(payload)
+        if size > self.client.settings.max_bytes:
             raise ValueError("Solution exceeds CCC_MAX_FILE_BYTES")
         self.validate_level(level, file_id)
         game = await self.session(contest)
@@ -250,12 +283,17 @@ class Service:
                     str(remaining),
                 )
             try:
-                response = await self.request(
-                    game.slug,
-                    "POST",
-                    f"/api/contestant/submit-{level}-{segment(file_id)}",
-                    files={"solution": (filename, payload, "application/octet-stream")},
-                )
+                if isinstance(payload, Path):
+                    with payload.open("rb") as stream:
+                        response = await self.request(
+                            game.slug, "POST", f"/api/contestant/submit-{level}-{segment(file_id)}",
+                            files={"solution": (filename, stream, "application/octet-stream")},
+                        )
+                else:
+                    response = await self.request(
+                        game.slug, "POST", f"/api/contestant/submit-{level}-{segment(file_id)}",
+                        files={"solution": (filename, payload, "application/octet-stream")},
+                    )
             except APIError as error:
                 if error.status == 429:
                     seconds = retry_seconds(error)

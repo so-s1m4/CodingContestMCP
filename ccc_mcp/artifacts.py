@@ -4,7 +4,9 @@ import base64
 import hashlib
 import io
 import math
+import os
 import re
+import tempfile
 import threading
 import uuid
 import zipfile
@@ -31,8 +33,24 @@ class Artifacts:
         path = (inbox / relative_path).resolve()
         if Path(relative_path).is_absolute() or not path.is_relative_to(inbox):
             raise ValueError("File must be inside CCC_DATA_DIR/inbox")
-        with path.open("rb") as stream:
-            return self.save(stream.read(self.limit + 1), path.name)
+        temporary = None
+        try:
+            with path.open("rb") as source, tempfile.NamedTemporaryFile(
+                dir=self.root, delete=False
+            ) as output:
+                temporary = Path(output.name)
+                copied = 0
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    copied += len(chunk)
+                    if copied > self.limit:
+                        raise ValueError("File exceeds CCC_MAX_FILE_BYTES")
+                    output.write(chunk)
+            result = self.adopt(temporary, path.name)
+            temporary = None
+            return result
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def path(self, artifact: str) -> Path:
         if not re.fullmatch(r"[a-f0-9]{32}", artifact):
@@ -56,6 +74,22 @@ class Artifacts:
             sha256=hashlib.sha256(data).hexdigest(),
             path=str(path),
         )
+
+    def adopt(self, source: Path, filename: str):
+        """Move a bounded temporary download into the artifact store."""
+        artifact = uuid.uuid4().hex
+        path = self.root / artifact
+        digest = hashlib.sha256()
+        size = 0
+        with source.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                size += len(chunk)
+                if size > self.limit:
+                    raise ValueError("File exceeds CCC_MAX_FILE_BYTES")
+                digest.update(chunk)
+        os.replace(source, path)
+        return dict(artifact_id=artifact, filename=filename, bytes=size,
+                    sha256=digest.hexdigest(), path=str(path))
 
     def read(self, artifact: str, offset=0, length=65536, encoding="text"):
         if offset < 0 or not 1 <= length <= 262144:
@@ -101,9 +135,24 @@ class Artifacts:
             if entry.is_dir() or entry.file_size > self.limit:
                 raise ValueError("ZIP member is a directory or too large")
             # Store by opaque id; archive paths are never used as filesystem paths.
-            with archive.open(entry) as stream:
-                payload = stream.read(self.limit + 1)
-            return self.save(payload, name)
+            temporary = None
+            try:
+                with archive.open(entry) as source, tempfile.NamedTemporaryFile(
+                    dir=self.root, delete=False
+                ) as output:
+                    temporary = Path(output.name)
+                    copied = 0
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        copied += len(chunk)
+                        if copied > self.limit:
+                            raise ValueError("ZIP member exceeds CCC_MAX_FILE_BYTES")
+                        output.write(chunk)
+                result = self.adopt(temporary, name)
+                temporary = None
+                return result
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
     def unpack(self, artifact: str):
         entries = self.archive(artifact)

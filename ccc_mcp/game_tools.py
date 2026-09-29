@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import traceback
 import zipfile
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import unquote
@@ -15,7 +16,7 @@ from urllib.parse import unquote
 import httpx
 from mcp.types import ImageContent
 
-from .context import current_service, current_session_pools, current_team_room
+from .context import current_account_uuid, current_service, current_session_pools, current_team_room
 from .download_links import download_links
 from .service import compact_progress, contest_slug, segment
 from .telegram_state import (
@@ -173,7 +174,11 @@ async def _notify_telegram_solution(
             status = "uncertain"
             detail = None
             try:
-                async with httpx.AsyncClient(timeout=settings.timeout) as client:
+                async with (
+                    nullcontext(service.telegram_client)
+                    if hasattr(service, "telegram_client")
+                    else httpx.AsyncClient(timeout=settings.timeout)
+                ) as client:
                     with archive_path.open("rb") as document:
                         response = await client.post(
                             url,
@@ -257,7 +262,7 @@ async def _notify_telegram_solution(
             return "failed"
 
 
-async def update_telegram_progress(configured, reset: bool = False):
+async def update_telegram_progress(configured, reset: bool = False, client=None):
     """Keep one Telegram message current with this deployment's solved levels."""
     if not configured.bot_token or not configured.bot_chat_id:
         return
@@ -284,7 +289,11 @@ async def update_telegram_progress(configured, reset: bool = False):
                 lines.append("Решённых уровней пока нет.")
             text = "\n".join(lines)
 
-        async with httpx.AsyncClient(timeout=min(configured.timeout, 15)) as client:
+        async with (
+            nullcontext(client)
+            if client is not None
+            else httpx.AsyncClient(timeout=min(configured.timeout, 15))
+        ) as client:
             if current and current["chat_id"] == str(configured.bot_chat_id):
                 response = await client.post(
                     f"https://api.telegram.org/bot{configured.bot_token}/editMessageText",
@@ -293,6 +302,7 @@ async def update_telegram_progress(configured, reset: bool = False):
                         "message_id": current["message_id"],
                         "text": text,
                     },
+                    timeout=min(configured.timeout, 15),
                 )
                 body = response.json()
                 if response.is_success and isinstance(body, dict) and body.get("ok") is True:
@@ -319,6 +329,7 @@ async def update_telegram_progress(configured, reset: bool = False):
             response = await client.post(
                 f"https://api.telegram.org/bot{configured.bot_token}/sendMessage",
                 json={"chat_id": configured.bot_chat_id, "text": text},
+                timeout=min(configured.timeout, 15),
             )
         body = response.json()
         result_body = body.get("result") if isinstance(body, dict) else None
@@ -376,11 +387,11 @@ async def prepare_level(contest: str, level: int):
     async def run():
         service = current_service()
         service.validate_level(level)
-        info = await service.info(contest)
-        archive = await service.asset(
-            info["contest_slug"],
-            f"/api/contestant/level/{level}/files",
-            f"level-{level}.zip",
+        info, archive = await asyncio.gather(
+            service.info(contest),
+            service.asset(
+                contest, f"/api/contestant/level/{level}/files", f"level-{level}.zip"
+            ),
         )
         files = await local(lambda: service.artifacts.unpack(archive["artifact_id"]))
         return {
@@ -539,6 +550,197 @@ async def upload_artifact(data_base64: str, filename: str = "solution.out"):
     return await _call(lambda: local(save))
 
 
+
+
+async def process_accepted_solution(service, pools, team_room, contest, level, file_id, filename, payload):
+    """Perform accepted-solution notifications and fanout outside the MCP response."""
+    feedback = {}
+    try:
+        notification_status = await _notify_telegram_solution(
+            service, contest, level, file_id, filename, payload
+        )
+        await update_telegram_progress(
+            service.client.settings, client=getattr(service, "telegram_client", None)
+        )
+    except Exception as error:
+        logger.error("Accepted-solution Telegram notification failed (%s)", type(error).__name__)
+        notification_status = f"failed: {type(error).__name__}"
+    feedback["telegram_notification"] = notification_status
+    source_suffix = "unknown"
+    try:
+        account = await service.client.json(
+            "GET", "/api/auth/current-user"
+        )
+        account_uuid = account.get("uuid") if isinstance(account, dict) else None
+        if not isinstance(account_uuid, str) or not account_uuid:
+            raise ValueError("Could not verify the submitting CCC account")
+        source_suffix = account_uuid[-6:]
+        game_slug = None
+        source_contest = contest_slug(contest)
+        try:
+            trainings = await service.client.json(
+                "GET", "/api/training/active"
+            )
+            if isinstance(trainings, list):
+                game_slug = next(
+                    (
+                        item.get("gameSlug")
+                        for item in trainings
+                        if isinstance(item, dict)
+                        and item.get("contestName") == source_contest
+                        and isinstance(item.get("gameSlug"), str)
+                    ),
+                    None,
+                )
+                if game_slug is None:
+                    normalized_contest = "".join(
+                        char for char in source_contest.casefold()
+                        if char.isalnum()
+                    )
+                    candidates = {
+                        item.get("gameSlug")
+                        for item in trainings
+                        if isinstance(item, dict)
+                        and isinstance(item.get("gameSlug"), str)
+                        and "".join(
+                            char for char in item["gameSlug"].casefold()
+                            if char.isalnum()
+                        ) in normalized_contest
+                    }
+                    if candidates:
+                        longest = max(len(candidate) for candidate in candidates)
+                        best = {
+                            candidate for candidate in candidates
+                            if len(candidate) == longest
+                        }
+                        if len(best) == 1:
+                            game_slug = best.pop()
+                            logger.info(
+                                "Resolved source training game slug from contest ID contest=%s game=%s source=CCC…%s",
+                                source_contest, game_slug, source_suffix,
+                            )
+                    if game_slug is None:
+                        games = await service.client.json("GET", "/api/games")
+                        if isinstance(games, list):
+                            candidates = {
+                                item.get("slug")
+                                for item in games
+                                if isinstance(item, dict)
+                                and isinstance(item.get("slug"), str)
+                                and "".join(
+                                    char for char in item["slug"].casefold()
+                                    if char.isalnum()
+                                ) in normalized_contest
+                            }
+                            if candidates:
+                                longest = max(len(candidate) for candidate in candidates)
+                                best = {
+                                    candidate for candidate in candidates
+                                    if len(candidate) == longest
+                                }
+                                if len(best) == 1:
+                                    game_slug = best.pop()
+                                    logger.info(
+                                        "Resolved source game slug from challenge catalog contest=%s game=%s source=CCC…%s",
+                                        source_contest, game_slug, source_suffix,
+                                    )
+            if game_slug is None:
+                logger.warning(
+                    "Could not resolve source training game slug contest=%s source=CCC…%s; fanout will retain the original contest ID",
+                    source_contest, source_suffix,
+                )
+        except Exception as error:
+            logger.warning(
+                "Could not read source training identity contest=%s source=CCC…%s (%s); fanout will retain the original contest ID",
+                source_contest, source_suffix, type(error).__name__,
+            )
+        if not team_room:
+            linked_rooms = await local(
+                lambda: pools.rooms_for_account(account_uuid)
+            )
+            if len(linked_rooms) == 1:
+                team_room = linked_rooms[0]
+                logger.info(
+                    "Auto-selected the only linked Telegram room room=%s source=CCC…%s",
+                    team_room, source_suffix,
+                )
+            elif len(linked_rooms) > 1:
+                fanout_status = (
+                    "skipped: CCC account belongs to multiple rooms; "
+                    "set X-CCC-Team-Room to choose one"
+                )
+                logger.warning(
+                    "Accepted solution not fanned out: multiple linked rooms and no X-CCC-Team-Room header source=CCC…%s rooms=%s contest=%s level=%s file_id=%s",
+                    source_suffix, linked_rooms, contest_slug(contest),
+                    level, file_id,
+                )
+            else:
+                fanout_status = (
+                    "skipped: CCC account is not linked to a room; connect it "
+                    "or set X-CCC-Team-Room"
+                )
+                logger.info(
+                    "Accepted solution not fanned out: no X-CCC-Team-Room and no linked rooms source=CCC…%s contest=%s level=%s file_id=%s",
+                    source_suffix, contest_slug(contest), level, file_id,
+                )
+        if team_room:
+            fanout = await local(
+                lambda: pools.enqueue_fanout(
+                    team_room,
+                    account_uuid,
+                    source_contest,
+                    level,
+                    str(file_id),
+                    filename,
+                    payload,
+                    game_slug,
+                )
+            )
+            if fanout["queued"]:
+                fanout_status = f"queued {fanout['queued']} delayed submissions"
+                logger.info(
+                    "Accepted solution added to room fanout room=%s contest=%s level=%s file_id=%s source=CCC…%s queued=%s targets=%s",
+                    team_room, source_contest, level, file_id,
+                    source_suffix, fanout["queued"], fanout["targets"],
+                )
+            elif not fanout["targets"]:
+                fanout_status = "not queued: no other CCC accounts are connected to this room"
+                logger.warning(
+                    "Accepted solution has no fanout targets room=%s contest=%s level=%s file_id=%s source=CCC…%s",
+                    team_room, contest_slug(contest), level, file_id,
+                    source_suffix,
+                )
+            else:
+                fanout_status = "no new jobs: these target accounts already have this submission queued or recorded"
+                logger.info(
+                    "Accepted solution produced no new fanout jobs room=%s contest=%s level=%s file_id=%s source=CCC…%s targets=%s existing=%s statuses=%s (duplicate queue keys)",
+                    team_room, contest_slug(contest), level, file_id,
+                    source_suffix, fanout["targets"], fanout.get("existing"),
+                    fanout.get("existing_statuses"),
+                )
+    except Exception as error:
+        fanout_status = f"failed: {type(error).__name__}"
+        detail = str(error)
+        for secret in (
+            service.client.settings.session,
+            service.client.settings.bot_token,
+            service.client.settings.bot_session_encryption_key,
+        ):
+            if secret:
+                detail = detail.replace(secret, "[redacted]")
+        logger.error(
+            "Accepted solution fanout failed room=%s contest=%s level=%s file_id=%s source=CCC…%s (%s): %s\n%s",
+            team_room or "unselected", contest_slug(contest), level, file_id,
+            source_suffix, type(error).__name__, detail[:1000],
+            "".join(traceback.format_tb(error.__traceback__)),
+        )
+        if isinstance(feedback, dict):
+            feedback["team_fanout"] = fanout_status
+    else:
+        if isinstance(feedback, dict):
+            feedback["team_fanout"] = fanout_status
+    return feedback
+
 @tool(read_only=False)
 async def submit_solution(
     contest: str,
@@ -561,195 +763,31 @@ async def submit_solution(
         payload = (
             solution.encode("utf-8")
             if solution is not None
-            else await local(
-                lambda: current_service().artifacts.path(artifact_id).read_bytes()
-            )
+            else current_service().artifacts.path(artifact_id)
         )
         service = current_service()
         feedback = await service.submit(contest, level, file_id, payload, filename)
         evaluation = feedback.get("evaluation") if isinstance(feedback, dict) else None
         if isinstance(evaluation, dict) and evaluation.get("isCorrect") is True:
-            notification_status = await _notify_telegram_solution(
-                service, contest, level, file_id, filename, payload
-            )
-            await update_telegram_progress(service.client.settings)
-            if isinstance(feedback, dict):
-                feedback["telegram_notification"] = notification_status
-            team_room = current_team_room()
-            source_suffix = "unknown"
-            try:
-                account = await service.client.json(
-                    "GET", "/api/auth/current-user"
-                )
-                account_uuid = account.get("uuid") if isinstance(account, dict) else None
-                if not isinstance(account_uuid, str) or not account_uuid:
-                    raise ValueError("Could not verify the submitting CCC account")
-                source_suffix = account_uuid[-6:]
-                pools = current_session_pools()
-                game_slug = None
-                source_contest = contest_slug(contest)
+            account_uuid = current_account_uuid()
+            if account_uuid:
                 try:
-                    trainings = await service.client.json(
-                        "GET", "/api/training/active"
+                    queued_payload = payload if isinstance(payload, bytes) else await local(payload.read_bytes)
+                    job_id = await local(
+                        lambda: current_session_pools().enqueue_accepted_solution(
+                            account_uuid, service.client.settings.session, contest_slug(contest),
+                            level, file_id, filename, queued_payload, current_team_room(),
+                        )
                     )
-                    if isinstance(trainings, list):
-                        game_slug = next(
-                            (
-                                item.get("gameSlug")
-                                for item in trainings
-                                if isinstance(item, dict)
-                                and item.get("contestName") == source_contest
-                                and isinstance(item.get("gameSlug"), str)
-                            ),
-                            None,
-                        )
-                        if game_slug is None:
-                            normalized_contest = "".join(
-                                char for char in source_contest.casefold()
-                                if char.isalnum()
-                            )
-                            candidates = {
-                                item.get("gameSlug")
-                                for item in trainings
-                                if isinstance(item, dict)
-                                and isinstance(item.get("gameSlug"), str)
-                                and "".join(
-                                    char for char in item["gameSlug"].casefold()
-                                    if char.isalnum()
-                                ) in normalized_contest
-                            }
-                            if candidates:
-                                longest = max(len(candidate) for candidate in candidates)
-                                best = {
-                                    candidate for candidate in candidates
-                                    if len(candidate) == longest
-                                }
-                                if len(best) == 1:
-                                    game_slug = best.pop()
-                                    logger.info(
-                                        "Resolved source training game slug from contest ID contest=%s game=%s source=CCC…%s",
-                                        source_contest, game_slug, source_suffix,
-                                    )
-                            if game_slug is None:
-                                games = await service.client.json("GET", "/api/games")
-                                if isinstance(games, list):
-                                    candidates = {
-                                        item.get("slug")
-                                        for item in games
-                                        if isinstance(item, dict)
-                                        and isinstance(item.get("slug"), str)
-                                        and "".join(
-                                            char for char in item["slug"].casefold()
-                                            if char.isalnum()
-                                        ) in normalized_contest
-                                    }
-                                    if candidates:
-                                        longest = max(len(candidate) for candidate in candidates)
-                                        best = {
-                                            candidate for candidate in candidates
-                                            if len(candidate) == longest
-                                        }
-                                        if len(best) == 1:
-                                            game_slug = best.pop()
-                                            logger.info(
-                                                "Resolved source game slug from challenge catalog contest=%s game=%s source=CCC…%s",
-                                                source_contest, game_slug, source_suffix,
-                                            )
-                    if game_slug is None:
-                        logger.warning(
-                            "Could not resolve source training game slug contest=%s source=CCC…%s; fanout will retain the original contest ID",
-                            source_contest, source_suffix,
-                        )
                 except Exception as error:
-                    logger.warning(
-                        "Could not read source training identity contest=%s source=CCC…%s (%s); fanout will retain the original contest ID",
-                        source_contest, source_suffix, type(error).__name__,
-                    )
-                if not team_room:
-                    linked_rooms = await local(
-                        lambda: pools.rooms_for_account(account_uuid)
-                    )
-                    if len(linked_rooms) == 1:
-                        team_room = linked_rooms[0]
-                        logger.info(
-                            "Auto-selected the only linked Telegram room room=%s source=CCC…%s",
-                            team_room, source_suffix,
-                        )
-                    elif len(linked_rooms) > 1:
-                        fanout_status = (
-                            "skipped: CCC account belongs to multiple rooms; "
-                            "set X-CCC-Team-Room to choose one"
-                        )
-                        logger.warning(
-                            "Accepted solution not fanned out: multiple linked rooms and no X-CCC-Team-Room header source=CCC…%s rooms=%s contest=%s level=%s file_id=%s",
-                            source_suffix, linked_rooms, contest_slug(contest),
-                            level, file_id,
-                        )
-                    else:
-                        fanout_status = (
-                            "skipped: CCC account is not linked to a room; connect it "
-                            "or set X-CCC-Team-Room"
-                        )
-                        logger.info(
-                            "Accepted solution not fanned out: no X-CCC-Team-Room and no linked rooms source=CCC…%s contest=%s level=%s file_id=%s",
-                            source_suffix, contest_slug(contest), level, file_id,
-                        )
-                if team_room:
-                    fanout = await local(
-                        lambda: pools.enqueue_fanout(
-                            team_room,
-                            account_uuid,
-                            source_contest,
-                            level,
-                            str(file_id),
-                            filename,
-                            payload,
-                            game_slug,
-                        )
-                    )
-                    if fanout["queued"]:
-                        fanout_status = f"queued {fanout['queued']} delayed submissions"
-                        logger.info(
-                            "Accepted solution added to room fanout room=%s contest=%s level=%s file_id=%s source=CCC…%s queued=%s targets=%s",
-                            team_room, source_contest, level, file_id,
-                            source_suffix, fanout["queued"], fanout["targets"],
-                        )
-                    elif not fanout["targets"]:
-                        fanout_status = "not queued: no other CCC accounts are connected to this room"
-                        logger.warning(
-                            "Accepted solution has no fanout targets room=%s contest=%s level=%s file_id=%s source=CCC…%s",
-                            team_room, contest_slug(contest), level, file_id,
-                            source_suffix,
-                        )
-                    else:
-                        fanout_status = "no new jobs: these target accounts already have this submission queued or recorded"
-                        logger.info(
-                            "Accepted solution produced no new fanout jobs room=%s contest=%s level=%s file_id=%s source=CCC…%s targets=%s existing=%s statuses=%s (duplicate queue keys)",
-                            team_room, contest_slug(contest), level, file_id,
-                            source_suffix, fanout["targets"], fanout.get("existing"),
-                            fanout.get("existing_statuses"),
-                        )
-            except Exception as error:
-                fanout_status = f"failed: {type(error).__name__}"
-                detail = str(error)
-                for secret in (
-                    service.client.settings.session,
-                    service.client.settings.bot_token,
-                    service.client.settings.bot_session_encryption_key,
-                ):
-                    if secret:
-                        detail = detail.replace(secret, "[redacted]")
-                logger.error(
-                    "Accepted solution fanout failed room=%s contest=%s level=%s file_id=%s source=CCC…%s (%s): %s\n%s",
-                    team_room or "unselected", contest_slug(contest), level, file_id,
-                    source_suffix, type(error).__name__, detail[:1000],
-                    "".join(traceback.format_tb(error.__traceback__)),
-                )
-                if isinstance(feedback, dict):
-                    feedback["team_fanout"] = fanout_status
-            else:
-                if isinstance(feedback, dict):
-                    feedback["team_fanout"] = fanout_status
+                    logger.error("Could not queue accepted solution (%s)", type(error).__name__)
+                    feedback["telegram_notification"] = "not queued"
+                    feedback["team_fanout"] = "not queued"
+                    feedback["delivery_error"] = type(error).__name__
+                else:
+                    feedback["delivery_job_id"] = job_id
+                    feedback["telegram_notification"] = "queued"
+                    feedback["team_fanout"] = "queued for background processing"
         elif current_team_room():
             logger.info(
                 "Room fanout skipped because CCC did not accept solution room=%s contest=%s level=%s file_id=%s is_correct=%s",
@@ -804,6 +842,23 @@ async def submit_solution(
     return await _call(run)
 
 
+@tool(read_only=True)
+async def solution_delivery_status(job_id: int):
+    """Check Telegram notification and team fanout queueing for an accepted solution."""
+    async def run():
+        account_uuid = current_account_uuid()
+        if not account_uuid:
+            raise ValueError("Authenticated account required")
+        status = await local(
+            lambda: current_session_pools().accepted_solution_status(job_id, account_uuid)
+        )
+        if status is None:
+            raise ValueError("Delivery job not found for this account")
+        return status
+
+    return await _call(run)
+
+
 @tool(read_only=False)
 async def ccc_api_request(
     method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"],
@@ -829,11 +884,13 @@ async def ccc_api_request(
             raise ValueError(
                 "Raw authentication endpoints are disabled"
             )
+        if response_format == "file":
+            return await current_service().response_file(
+                method, path, filename, params=_params(query), json_body=body
+            )
         response = await current_service().client.request(
             method, path, params=_params(query), json_body=body
         )
-        if response_format == "file":
-            return current_service().artifacts.save(response.content, filename)
         return response.json() if response.content else None
 
     return await _call(run)
@@ -854,11 +911,14 @@ async def game_api_request(
     async def run():
         if method != "GET" and not current_service().client.settings.enable_raw_writes:
             raise ValueError("Set CCC_ENABLE_RAW_WRITES=1 for generic mutations")
+        if response_format == "file":
+            return await current_service().response_file(
+                method, path, filename, contest=contest,
+                params=_params(query), json_body=body,
+            )
         response = await current_service().request(
             contest, method, path, params=_params(query), json_body=body
         )
-        if response_format == "file":
-            return current_service().artifacts.save(response.content, filename)
         return response.json() if response.content else None
 
     return await _call(run)

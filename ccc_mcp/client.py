@@ -6,12 +6,36 @@ import re
 from http.cookies import SimpleCookie
 from typing import Any
 from urllib.parse import unquote, urlsplit
+from urllib.request import proxy_bypass
 
 import httpx
 
 from .config import Settings
 
 PLATFORM = "https://codingcontest.org"
+
+
+class SharedTransport(httpx.AsyncBaseTransport):
+    """A per-client view of a connection pool whose owner controls shutdown."""
+
+    def __init__(self, transport: httpx.AsyncBaseTransport, proxy_transport=None):
+        self.transport = transport
+        self.proxy_transport = proxy_transport
+        self.proxy_bypass_cache = {}
+
+    async def handle_async_request(self, request):
+        host = request.url.host
+        if self.proxy_transport is not None and host not in self.proxy_bypass_cache:
+            self.proxy_bypass_cache[host] = proxy_bypass(host)
+        transport = (
+            self.proxy_transport
+            if self.proxy_transport is not None and not self.proxy_bypass_cache[host]
+            else self.transport
+        )
+        return await transport.handle_async_request(request)
+
+    async def aclose(self):
+        pass
 
 
 class APIError(RuntimeError):
@@ -90,16 +114,22 @@ class CCCClient:
         await self.platform.aclose()
         await self.games.aclose()
 
-    async def _send(self, http, method, url, **kwargs):
+    async def _send(self, http, method, url, *, output=None, **kwargs):
         async with http.stream(method, url, **kwargs) as response:
-            return await self._consume(response)
+            return await self._consume(response, output)
 
-    async def _consume(self, response):
+    async def _consume(self, response, output=None):
         payload = bytearray()
+        size = 0
+        streamed = output is not None and response.is_success and "json" not in response.headers.get("content-type", "")
         async for chunk in response.aiter_bytes():
-            payload.extend(chunk)
-            if len(payload) > self.settings.max_bytes:
+            size += len(chunk)
+            if size > self.settings.max_bytes:
                 raise ValueError("Upstream response exceeds CCC_MAX_FILE_BYTES")
+            if streamed:
+                output.write(chunk)
+            else:
+                payload.extend(chunk)
         # aiter_bytes already decodes HTTP compression. Do not decode it twice.
         headers = dict(response.headers)
         headers.pop("content-encoding", None)
@@ -131,6 +161,7 @@ class CCCClient:
         params=None,
         json_body=None,
         files=None,
+        output=None,
     ):
         method = method.upper()
         if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
@@ -158,7 +189,7 @@ class CCCClient:
             request.headers.pop("cookie", None)
             response = await self.games.send(request, stream=True)
             try:
-                return await self._consume(response)
+                return await self._consume(response, output)
             finally:
                 await response.aclose()
         # Serialize cookie rotation and CSRF bootstrap, including mutations.
@@ -169,7 +200,7 @@ class CCCClient:
             if method != "GET" and self._xsrf():
                 headers["X-XSRF-TOKEN"] = unquote(self._xsrf())
             return await self._send(
-                self.platform, method, PLATFORM + path, headers=headers, **kwargs
+                self.platform, method, PLATFORM + path, headers=headers, output=output, **kwargs
             )
 
     def _xsrf(self):
