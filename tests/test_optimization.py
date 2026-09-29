@@ -134,6 +134,12 @@ class OptimizationTests(unittest.IsolatedAsyncioTestCase):
                     )
                 # Give the second item the same target account as the first.
                 connection.execute("UPDATE telegram_fanout_queue SET target_uuid = 'a1' WHERE file_id = '2'")
+                # This test starts with confirmed jobs to isolate scheduling.
+                connection.execute(
+                    "UPDATE telegram_fanout_queue SET approved_by = "
+                    "(SELECT telegram_user_id FROM telegram_room_members m "
+                    "WHERE m.room = telegram_fanout_queue.room AND m.account_uuid = target_uuid)"
+                )
             first = pools.claim_due()
             self.assertEqual(first["file_id"], "1")
             second = pools.claim_due()

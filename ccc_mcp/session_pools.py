@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import random
@@ -89,6 +90,21 @@ class SessionPools:
                 );
                 CREATE INDEX IF NOT EXISTS telegram_fanout_due
                     ON telegram_fanout_queue(status, run_after);
+                CREATE TABLE IF NOT EXISTS telegram_level_packs (
+                    room TEXT NOT NULL, contest TEXT NOT NULL, level INTEGER NOT NULL,
+                    expected_files TEXT NOT NULL,
+                    PRIMARY KEY (room, contest, level)
+                );
+                CREATE TABLE IF NOT EXISTS telegram_upload_offers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_user_id TEXT NOT NULL,
+                    room TEXT NOT NULL,
+                    contest TEXT NOT NULL,
+                    level INTEGER NOT NULL,
+                    target_uuid TEXT NOT NULL,
+                    retry_at REAL NOT NULL DEFAULT 0,
+                    notified INTEGER NOT NULL DEFAULT 0
+                );
                 CREATE TABLE IF NOT EXISTS accepted_solution_queue (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     account_uuid TEXT NOT NULL,
@@ -130,6 +146,8 @@ class SessionPools:
                 ("telegram_room_members", "telegram_label", "TEXT", "''"),
                 ("telegram_enrollment_links", "telegram_label", "TEXT", "''"),
                 ("telegram_fanout_queue", "manual", "INTEGER", "0"),
+                ("telegram_fanout_queue", "approved_by", "TEXT", "''"),
+                ("telegram_fanout_queue", "offer_id", "INTEGER", "0"),
                 ("telegram_fanout_queue", "game_slug", "TEXT", "''"),
             ):
                 columns = {
@@ -150,7 +168,7 @@ class SessionPools:
                 )
             connection.execute(
                 """UPDATE telegram_fanout_queue SET payload = X''
-                   WHERE status IN ('sent', 'rejected', 'failed') AND created_at < ?""",
+                   WHERE status IN ('sent', 'rejected', 'failed', 'declined') AND created_at < ?""",
                 (time.time() - RESEND_RETENTION_SECONDS,),
             )
         self.recover_stale_jobs()
@@ -278,6 +296,7 @@ class SessionPools:
                 "SELECT COUNT(*) FROM telegram_fanout_queue"
             ).fetchone()[0]
             connection.execute("DELETE FROM telegram_fanout_queue")
+            connection.execute("DELETE FROM telegram_upload_offers")
             connection.execute("DELETE FROM telegram_target_cooldowns")
         return count
 
@@ -384,6 +403,13 @@ class SessionPools:
             raise ValueError("BOT_SESSION_ENCRYPTION_KEY is not configured")
         encrypted = self.fernet.encrypt(session.encode())
         with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.execute(
+                """UPDATE telegram_fanout_queue SET approved_by = '', offer_id = 0
+                   WHERE room = ? AND target_uuid = ? AND status = 'queued'
+                     AND EXISTS (SELECT 1 FROM telegram_room_members
+                         WHERE room = ? AND account_uuid = ? AND telegram_user_id != ?)""",
+                (room, account_uuid, room, account_uuid, telegram_user_id),
+            )
             connection.execute(
                 """INSERT INTO telegram_room_members
                    (room, telegram_user_id, telegram_label, account_uuid, session_cipher, added_at)
@@ -518,7 +544,8 @@ class SessionPools:
                               FROM telegram_target_cooldowns c
                               WHERE c.account_uuid = q.target_uuid
                           ), 0)),
-                          q.status
+                          CASE WHEN q.status = 'queued' AND q.approved_by != m.telegram_user_id
+                               THEN 'awaiting_confirmation' ELSE q.status END
                    FROM telegram_fanout_queue q
                    JOIN telegram_room_members m
                      ON m.room = q.room AND m.account_uuid = q.target_uuid
@@ -673,7 +700,7 @@ class SessionPools:
                             connection.execute(
                                 """UPDATE telegram_fanout_queue
                                    SET filename = ?, payload = ?,
-                                       game_slug = COALESCE(?, game_slug)
+                                       game_slug = COALESCE(?, game_slug), approved_by = '', offer_id = 0
                                    WHERE id = ? AND status = 'queued'""",
                                 (item["filename"], item["payload"], item["game_slug"], existing[0]),
                             )
@@ -684,7 +711,7 @@ class SessionPools:
                                SET filename = ?, payload = ?,
                                    game_slug = COALESCE(?, game_slug), source_uuid = ?,
                                    run_after = ?, status = 'queued', claimed_at = NULL,
-                                   manual = 0, detail = NULL, created_at = ?
+                                   manual = 0, detail = NULL, approved_by = '', offer_id = 0, created_at = ?
                                WHERE id = ?""",
                             (
                                 item["filename"], item["payload"], item["game_slug"],
@@ -798,7 +825,7 @@ class SessionPools:
                         connection.execute(
                             """UPDATE telegram_fanout_queue
                                SET filename = ?, payload = ?,
-                                   game_slug = COALESCE(?, game_slug)
+                                   game_slug = COALESCE(?, game_slug), approved_by = '', offer_id = 0
                                WHERE id = ? AND status = 'queued'""",
                             (item["filename"], item["payload"], item["game_slug"], existing[0]),
                         )
@@ -809,7 +836,7 @@ class SessionPools:
                            SET filename = ?, payload = ?,
                                game_slug = COALESCE(?, game_slug), source_uuid = ?,
                                run_after = ?, status = 'queued', claimed_at = NULL,
-                               manual = 0, detail = NULL, created_at = ?
+                               manual = 0, detail = NULL, approved_by = '', offer_id = 0, created_at = ?
                            WHERE id = ?""",
                         (
                             item["filename"], item["payload"], item["game_slug"],
@@ -829,6 +856,12 @@ class SessionPools:
                         ),
                     )
                 queued += 1
+            connection.execute(
+                """UPDATE telegram_fanout_queue SET approved_by = ?
+                   WHERE room = ? AND contest = ? AND level = ? AND target_uuid = ?
+                     AND status = 'queued'""",
+                (telegram_user_id, room, contest, level, target_uuid),
+            )
         return {"queued": queued, "files": len(files), "already_active": already_active}
 
     def resend_job(self, job_id: int, telegram_user_id: str):
@@ -853,7 +886,7 @@ class SessionPools:
                 raise ValueError("Аккаунт отключён от комнаты; сначала подключите его снова")
             connection.execute(
                 """UPDATE telegram_fanout_queue
-                   SET status = 'queued', run_after = ?, manual = 1, detail = NULL
+                   SET status = 'queued', run_after = ?, manual = 1, detail = NULL, approved_by = '', offer_id = 0
                    WHERE id = ?""",
                 (time.time(), job_id),
             )
@@ -869,6 +902,7 @@ class SessionPools:
         filename: str,
         payload: bytes,
         game_slug: str | None = None,
+        expected_files: list[str] | None = None,
     ):
         now = time.time()
         added = 0
@@ -886,6 +920,12 @@ class SessionPools:
             ).fetchone()
             if not source:
                 raise ValueError("The submitting CCC account is not connected to this room")
+            if expected_files:
+                connection.execute(
+                    """INSERT INTO telegram_level_packs VALUES (?, ?, ?, ?)
+                       ON CONFLICT(room, contest, level) DO UPDATE SET expected_files = excluded.expected_files""",
+                    (room, contest, level, json.dumps(list(dict.fromkeys(map(str, expected_files))))),
+                )
             for (target_uuid,) in members:
                 cursor = connection.execute(
                     """INSERT OR IGNORE INTO telegram_fanout_queue
@@ -915,7 +955,7 @@ class SessionPools:
                         """UPDATE telegram_fanout_queue
                            SET filename = ?, payload = ?, game_slug = COALESCE(?, game_slug), source_uuid = ?,
                                run_after = ?, status = 'queued', claimed_at = NULL,
-                               manual = 0, detail = NULL
+                               manual = 0, detail = NULL, approved_by = '', offer_id = 0
                            WHERE id = ? AND status IN ('failed', 'rejected', 'cancelled')""",
                         (
                             filename, payload, game_slug, source_uuid,
@@ -927,7 +967,7 @@ class SessionPools:
                     connection.execute(
                         """UPDATE telegram_fanout_queue
                            SET filename = ?, payload = ?,
-                               game_slug = COALESCE(?, game_slug), source_uuid = ?
+                               game_slug = COALESCE(?, game_slug), source_uuid = ?, approved_by = '', offer_id = 0
                            WHERE id = ? AND status = 'queued'""",
                         (filename, payload, game_slug, source_uuid, job_id),
                     )
@@ -939,6 +979,93 @@ class SessionPools:
             "existing_statuses": existing_statuses,
         }
 
+    @staticmethod
+    def _pack_complete(connection, room, contest, level, target_uuid):
+        pack = connection.execute(
+            "SELECT expected_files FROM telegram_level_packs WHERE room = ? AND contest = ? AND level = ?",
+            (room, contest, level),
+        ).fetchone()
+        if not pack:
+            return False
+        expected = set(json.loads(pack[0]))
+        available = {row[0] for row in connection.execute(
+            """SELECT file_id FROM telegram_fanout_queue
+               WHERE room = ? AND contest = ? AND level = ? AND target_uuid = ?""",
+            (room, contest, level, target_uuid),
+        )}
+        return bool(expected) and expected <= available
+
+    def next_upload_offer(self):
+        """Persist a snapshot and reserve notification delivery across workers."""
+        now = time.time()
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("BEGIN IMMEDIATE")
+            candidates = connection.execute(
+                """SELECT q.room, q.contest, q.level, q.target_uuid, m.telegram_user_id
+                   FROM telegram_fanout_queue q JOIN telegram_room_members m
+                     ON m.room = q.room AND m.account_uuid = q.target_uuid
+                   WHERE q.status = 'queued' AND q.approved_by != m.telegram_user_id
+                     AND q.offer_id = 0 GROUP BY q.room, q.contest, q.level, q.target_uuid ORDER BY MIN(q.id)"""
+            ).fetchall()
+            pending = next((row for row in candidates if self._pack_complete(connection, *tuple(row)[:4])), None)
+            if pending:
+                cursor = connection.execute(
+                    """INSERT INTO telegram_upload_offers
+                       (room, contest, level, target_uuid, telegram_user_id)
+                       VALUES (?, ?, ?, ?, ?)""", tuple(pending),
+                )
+                connection.execute(
+                    """UPDATE telegram_fanout_queue SET offer_id = ?
+                       WHERE room = ? AND contest = ? AND level = ? AND target_uuid = ?
+                         AND status = 'queued' AND approved_by != ? AND offer_id = 0""",
+                    (cursor.lastrowid, *tuple(pending)),
+                )
+            offers = connection.execute(
+                """SELECT o.*, COUNT(q.id) AS files FROM telegram_upload_offers o
+                   JOIN telegram_fanout_queue q ON q.offer_id = o.id
+                   JOIN telegram_room_members m ON m.room = q.room
+                     AND m.account_uuid = q.target_uuid AND m.telegram_user_id = o.telegram_user_id
+                   WHERE o.notified = 0 AND o.retry_at <= ? AND q.status = 'queued'
+                     AND q.approved_by != m.telegram_user_id
+                   GROUP BY o.id ORDER BY o.id""", (now,),
+            ).fetchall()
+            offer = next((row for row in offers if self._pack_complete(
+                connection, row["room"], row["contest"], row["level"], row["target_uuid"]
+            )), None)
+            if offer:
+                connection.execute(
+                    "UPDATE telegram_upload_offers SET retry_at = ? WHERE id = ?",
+                    (now + 60, offer["id"]),
+                )
+            return dict(offer) if offer else None
+
+    def mark_upload_offer_sent(self, offer_id):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.execute(
+                "UPDATE telegram_upload_offers SET notified = 1 WHERE id = ?", (offer_id,)
+            )
+
+    def answer_upload_offer(self, offer_id: int, user_id: str, accept: bool):
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            offer = connection.execute(
+                """SELECT o.room, o.contest, o.level, o.target_uuid FROM telegram_upload_offers o JOIN telegram_room_members m
+                   ON m.room = o.room AND m.account_uuid = o.target_uuid
+                     AND m.telegram_user_id = o.telegram_user_id
+                   WHERE o.id = ? AND o.telegram_user_id = ?""",
+                (offer_id, user_id),
+            ).fetchone()
+            if not offer:
+                raise ValueError("Предложение недоступно для вашего аккаунта")
+            if not self._pack_complete(connection, *offer):
+                raise ValueError("Полный пак уровня ещё не готов")
+            return connection.execute(
+                """UPDATE telegram_fanout_queue SET approved_by = ?, status = ?
+                   WHERE offer_id = ? AND status = 'queued' AND approved_by = ''""",
+                (user_id, "queued" if accept else "declined", offer_id),
+            ).rowcount
+
     def claim_due(self):
         with sqlite3.connect(self.database, timeout=30) as connection:
             connection.row_factory = sqlite3.Row
@@ -948,6 +1075,7 @@ class SessionPools:
                    JOIN telegram_room_members m
                      ON m.room = q.room AND m.account_uuid = q.target_uuid
                    WHERE q.status = 'queued' AND q.run_after <= ?
+                     AND q.approved_by = m.telegram_user_id
                      AND NOT EXISTS (
                          SELECT 1 FROM telegram_target_cooldowns c
                          WHERE c.account_uuid = q.target_uuid AND c.next_send_at > ?

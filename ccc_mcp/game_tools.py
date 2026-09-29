@@ -687,6 +687,16 @@ async def process_accepted_solution(service, pools, team_room, contest, level, f
                     source_suffix, contest_slug(contest), level, file_id,
                 )
         if team_room:
+            expected_files = None
+            try:
+                info = await service.info(contest)
+                expected_files = next(
+                    (item.get("inputFiles", []) for item in info.get("levels", [])
+                     if item.get("level") == level), []
+                )
+                expected_files = [str(item) for item in expected_files if isinstance(item, (str, int))]
+            except Exception as error:
+                logger.warning("Could not load level pack manifest (%s)", type(error).__name__)
             fanout = await local(
                 lambda: pools.enqueue_fanout(
                     team_room,
@@ -697,10 +707,11 @@ async def process_accepted_solution(service, pools, team_room, contest, level, f
                     filename,
                     payload,
                     game_slug,
+                    expected_files=expected_files,
                 )
             )
             if fanout["queued"]:
-                fanout_status = f"queued {fanout['queued']} delayed submissions"
+                fanout_status = f"awaiting recipient confirmation for {fanout['queued']} submissions"
                 logger.info(
                     "Accepted solution added to room fanout room=%s contest=%s level=%s file_id=%s source=CCC…%s queued=%s targets=%s",
                     team_room, source_contest, level, file_id,

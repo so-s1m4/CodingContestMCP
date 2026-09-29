@@ -336,7 +336,9 @@ class TelegramPoolBot:
                 label = item["telegram_label"] or item["telegram_user_id"]
                 account_suffix = item["target_uuid"][-6:]
                 status_text = (
-                    "  отправляется сейчас"
+                    "  ожидает вашего подтверждения в Telegram"
+                    if item["status"] == "awaiting_confirmation"
+                    else "  отправляется сейчас"
                     if item["status"] == "sending"
                     else (
                         f"  через {max(0, int(item['due_at'] - time.time()))} с"
@@ -372,6 +374,27 @@ class TelegramPoolBot:
         self.callback_source_message_id = (
             source_message_id if isinstance(source_message_id, int) else None
         )
+        if isinstance(data, str) and data.startswith("upload:"):
+            parts = data.split(":")
+            if len(parts) != 3 or parts[1] not in ("yes", "no") or not parts[2].isdigit():
+                return
+            try:
+                count = await asyncio.to_thread(
+                    self.pools.answer_upload_offer, int(parts[2]), str(sender["id"]),
+                    parts[1] == "yes",
+                )
+                text = (
+                    f"Пак подтверждён: к загрузке от вашего имени {count} файл(ов)."
+                    if parts[1] == "yes" else "Загрузка отменена."
+                ) if count else "Предложение уже обработано или устарело."
+                self.queue_wakeup.set()
+            except ValueError as error:
+                text = str(error)
+            await self._telegram(
+                "answerCallbackQuery", callback_query_id=callback_id,
+                text=text, show_alert=True,
+            )
+            return
         if isinstance(data, str) and data.startswith("replay:"):
             await self._handle_replay_callback(callback, data)
             return
@@ -382,7 +405,7 @@ class TelegramPoolBot:
             await self._telegram(
                 "answerCallbackQuery",
                 callback_query_id=callback_id,
-                text="Очередь отправляется автоматически — эта кнопка больше не нужна.",
+                text="Загрузка доступна только после вашего подтверждения в сообщении бота.",
             )
             return
         if not isinstance(data, str) or not data.startswith("resend:"):
@@ -396,8 +419,8 @@ class TelegramPoolBot:
             await asyncio.to_thread(
                 self.pools.resend_job, int(raw_job_id), str(sender["id"])
             )
-            message_text = f"Повтор отправки #{raw_job_id} выбранному аккаунту поставлен в очередь."
-            callback_text = "Повтор для этого аккаунта запущен."
+            message_text = f"Повтор #{raw_job_id} ожидает подтверждения владельца аккаунта в Telegram."
+            callback_text = "Создан запрос на подтверждение."
             await self._telegram(
                 "answerCallbackQuery", callback_query_id=callback_id,
                 text=callback_text,
@@ -849,7 +872,7 @@ class TelegramPoolBot:
                 self.replay_flows.pop(flow_id, None)
                 text = (
                     f"✅ Level {level} поставлен на повтор: {outcome['queued']} файлов "
-                    f"для {outcome['targets']} аккаунтов."
+                    f"для {outcome['targets']} аккаунтов. Загрузка начнётся после их подтверждения."
                 )
                 if outcome["already_active"]:
                     text += f"\nУже в очереди или отправляются: {outcome['already_active']} файловых отправок."
@@ -918,6 +941,25 @@ class TelegramPoolBot:
                 {"inline_keyboard": keyboard_rows + self._room_markup(room, is_owner)["inline_keyboard"]},
                 replace_previous=start == 0,
             )
+
+    async def _notify_upload_offer(self):
+        offer = await asyncio.to_thread(self.pools.next_upload_offer)
+        if not offer:
+            return
+        await self._telegram(
+            "sendMessage", chat_id=offer["telegram_user_id"],
+            text=(
+                f"Хотите загрузить {offer['contest']} — уровень {offer['level']} "
+                f"от своего имени целым паком?\nКомната: {offer['room']}. "
+                f"Пак уровня готов. Файлов к загрузке: {offer['files']}."
+            ),
+            reply_markup={"inline_keyboard": [[
+                {"text": "Да, загрузить весь пак",
+                 "callback_data": f"upload:yes:{offer['id']}"},
+                {"text": "Нет", "callback_data": f"upload:no:{offer['id']}"},
+            ]]},
+        )
+        await asyncio.to_thread(self.pools.mark_upload_offer_sent, offer["id"])
 
     async def _deliver_one(self):
         job = await asyncio.to_thread(self.pools.claim_due)
@@ -992,6 +1034,7 @@ class TelegramPoolBot:
                 if recover and now - last_recovery >= 30:
                     await asyncio.to_thread(self.pools.recover_stale_jobs)
                     last_recovery = now
+                await self._notify_upload_offer()
                 delivered = await self._deliver_one()
                 if not delivered:
                     try:
