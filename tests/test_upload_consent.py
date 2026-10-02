@@ -109,6 +109,41 @@ class UploadConsentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.pools.claim_due())
         self.assertNotEqual(self.offer_for("2")["id"], offer["id"])
 
+    def test_duplicate_answer_does_not_repeat_notification_after_restart(self):
+        self.enqueue()
+        offer = self.offer_for("2")
+        self.offer_for("3")
+        self.pools = SessionPools(self.pools.database, self.key)
+        for _ in range(5):
+            self.enqueue()
+            self.assertIsNone(self.pools.next_upload_offer())
+        self.assertEqual(self.pools.answer_upload_offer(offer["id"], "2", True), 1)
+
+    def test_same_answer_from_another_source_preserves_consent(self):
+        self.enqueue()
+        offer = self.offer_for("2")
+        self.offer_for("3")
+        self.assertEqual(self.pools.answer_upload_offer(offer["id"], "2", True), 1)
+        self.pools.enqueue_fanout(
+            "room", "other", "contest", 5, "1", "renamed.txt", b"answer",
+            expected_files=self.expected_files,
+        )
+        # The original sender is a new recipient of the other source's fanout.
+        self.offer_for("1")
+        self.assertIsNone(self.pools.next_upload_offer())
+        job = self.pools.claim_due()
+        self.assertIsNotNone(job)
+        self.assertEqual(job["target_uuid"], "target")
+
+    def test_changed_answer_revokes_consent(self):
+        self.enqueue()
+        offer = self.offer_for("2")
+        self.assertEqual(self.pools.answer_upload_offer(offer["id"], "2", True), 1)
+        self.enqueue(payload=b"replacement")
+        self.assertIsNone(self.pools.claim_due())
+        self.assertEqual(self.pools.answer_upload_offer(offer["id"], "2", True), 0)
+        self.assertNotEqual(self.offer_for("2")["id"], offer["id"])
+
     def test_decline_restart_and_self_replay(self):
         self.enqueue()
         offer = self.offer_for("2")

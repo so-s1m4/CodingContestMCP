@@ -969,12 +969,14 @@ class SessionPools:
                     )
                     requeued += updated.rowcount
                 elif status == "queued":
+                    # Another account or delivery retry may submit identical bytes.
+                    # Keep the existing offer and consent unless the answer changes.
                     connection.execute(
                         """UPDATE telegram_fanout_queue
                            SET filename = ?, payload = ?,
                                game_slug = COALESCE(?, game_slug), source_uuid = ?, approved_by = '', offer_id = 0
-                           WHERE id = ? AND status = 'queued'""",
-                        (filename, payload, game_slug, source_uuid, job_id),
+                           WHERE id = ? AND status = 'queued' AND payload != ?""",
+                        (filename, payload, game_slug, source_uuid, job_id, payload),
                     )
         return {
             "queued": added + requeued,
