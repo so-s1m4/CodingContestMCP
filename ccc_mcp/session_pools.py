@@ -7,7 +7,6 @@ import hmac
 import json
 import logging
 import os
-import random
 import secrets
 import sqlite3
 import tempfile
@@ -542,11 +541,7 @@ class SessionPools:
             rows = connection.execute(
                 """SELECT q.id, q.contest, q.level, q.file_id, q.target_uuid,
                           m.telegram_label, m.telegram_user_id,
-                          MAX(q.run_after, COALESCE((
-                              SELECT MAX(c.next_send_at)
-                              FROM telegram_target_cooldowns c
-                              WHERE c.account_uuid = q.target_uuid
-                          ), 0)),
+                          q.run_after,
                           CASE WHEN q.status = 'queued' AND q.approved_by != m.telegram_user_id
                                THEN 'awaiting_confirmation' ELSE q.status END
                    FROM telegram_fanout_queue q
@@ -1084,15 +1079,11 @@ class SessionPools:
                    WHERE q.status = 'queued' AND q.run_after <= ?
                      AND q.approved_by = m.telegram_user_id
                      AND NOT EXISTS (
-                         SELECT 1 FROM telegram_target_cooldowns c
-                         WHERE c.account_uuid = q.target_uuid AND c.next_send_at > ?
-                     )
-                     AND NOT EXISTS (
                          SELECT 1 FROM telegram_fanout_queue active
                          WHERE active.target_uuid = q.target_uuid AND active.status = 'sending'
                      )
                    ORDER BY q.manual DESC, q.run_after, q.id LIMIT 1""",
-                (time.time(), time.time()),
+                (time.time(),),
             ).fetchone()
             if row is None:
                 return None
@@ -1113,20 +1104,8 @@ class SessionPools:
 
     def finish_job(self, job_id: int, status: str, detail: str | None = None):
         with sqlite3.connect(self.database, timeout=30) as connection:
-            row = connection.execute(
-                "SELECT room, target_uuid FROM telegram_fanout_queue WHERE id = ? AND status = 'sending'",
-                (job_id,),
-            ).fetchone()
             connection.execute(
                 """UPDATE telegram_fanout_queue
                    SET status = ?, detail = ?, claimed_at = NULL WHERE id = ?""",
                 (status, detail, job_id),
             )
-            if row:
-                connection.execute(
-                    """INSERT INTO telegram_target_cooldowns (room, account_uuid, next_send_at)
-                       VALUES (?, ?, ?)
-                       ON CONFLICT(room, account_uuid) DO UPDATE SET
-                         next_send_at = MAX(next_send_at, excluded.next_send_at)""",
-                    (row[0], row[1], time.time() + random.randint(60, 180)),
-                )

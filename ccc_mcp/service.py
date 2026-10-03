@@ -1,7 +1,6 @@
 """Contest-scoped workflow with private game tokens and artifact handles."""
 
 import asyncio
-import math
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -10,7 +9,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 from .artifacts import Artifacts
 from .client import APIError, CCCClient, game_origin
-from .sessions import GameSessions, retry_seconds
+from .sessions import GameSessions
 
 
 def site_slug(value: str, collection: str) -> str:
@@ -111,7 +110,6 @@ class Service:
                 and time.monotonic() - existing.created < 240
             ):
                 return existing
-            self.games.check_cooldown()
             data = await self.client.json("GET", f"/api/contests/{segment(contest)}")
             origin = game_origin(data.get("gameBaseUrl", ""))
             slug = data["slug"]
@@ -124,14 +122,9 @@ class Service:
                 if len(self.games.games) < 100:
                     self.games.games[contest] = existing
                 return existing
-            try:
-                result = await self.client.json(
-                    "POST", "/api/game-token", json_body={"contestSlug": slug}
-                )
-            except APIError as error:
-                if error.status == 429:
-                    self.games.rate_limited(error)
-                raise
+            result = await self.client.json(
+                "POST", "/api/game-token", json_body={"contestSlug": slug}
+            )
             token = result.get("token")
             if not isinstance(token, str) or not token:
                 raise ValueError("CCC returned no game token")
@@ -265,49 +258,15 @@ class Service:
             raise ValueError("Solution exceeds CCC_MAX_FILE_BYTES")
         self.validate_level(level, file_id)
         game = await self.session(contest)
-        async with self.games.submission_lock:
-            now = time.monotonic()
-            cooldowns = self.games.submission_cooldowns
-            for key in list(cooldowns):
-                if cooldowns[key] <= now:
-                    del cooldowns[key]
-            remaining = math.ceil(cooldowns.get(game.slug, 0) - now)
-            if remaining > 0:
-                raise APIError(
-                    429,
-                    {
-                        "source": "codingcontest.org",
-                        "contest": game.slug,
-                        "message": "Submission cooldown; no upstream submission was sent",
-                    },
-                    str(remaining),
+        if isinstance(payload, Path):
+            with payload.open("rb") as stream:
+                response = await self.request(
+                    game.slug, "POST", f"/api/contestant/submit-{level}-{segment(file_id)}",
+                    files={"solution": (filename, stream, "application/octet-stream")},
                 )
-            try:
-                if isinstance(payload, Path):
-                    with payload.open("rb") as stream:
-                        response = await self.request(
-                            game.slug, "POST", f"/api/contestant/submit-{level}-{segment(file_id)}",
-                            files={"solution": (filename, stream, "application/octet-stream")},
-                        )
-                else:
-                    response = await self.request(
-                        game.slug, "POST", f"/api/contestant/submit-{level}-{segment(file_id)}",
-                        files={"solution": (filename, payload, "application/octet-stream")},
-                    )
-            except APIError as error:
-                if error.status == 429:
-                    seconds = retry_seconds(error)
-                    cooldowns[game.slug] = time.monotonic() + seconds
-                    error.retry_after = str(seconds)
-                raise
-            feedback = response.json()
-            seconds = (
-                feedback.get("cooldownSec", 0) if isinstance(feedback, dict) else 0
+        else:
+            response = await self.request(
+                game.slug, "POST", f"/api/contestant/submit-{level}-{segment(file_id)}",
+                files={"solution": (filename, payload, "application/octet-stream")},
             )
-            if (
-                isinstance(seconds, (int, float))
-                and math.isfinite(seconds)
-                and seconds > 0
-            ):
-                cooldowns[game.slug] = time.monotonic() + seconds
-            return feedback
+        return response.json()

@@ -11,11 +11,11 @@ from ccc_mcp.app import create_app
 from ccc_mcp.client import APIError, CCCClient
 from ccc_mcp.config import Settings
 from ccc_mcp.service import Service, contest_slug
-from ccc_mcp.sessions import AccountSessions, GameSessions, retry_seconds
+from ccc_mcp.sessions import AccountSessions, GameSessions
 
 
 class SessionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_submission_cooldown_shared_across_agents_and_slug_aliases(self):
+    async def test_submissions_ignore_cooldown_across_agents_and_slug_aliases(self):
         with tempfile.TemporaryDirectory() as root:
             submissions = 0
             tokens = 0
@@ -54,17 +54,11 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                     services[1].submit("training-2026-03", 1, "2", b"answer", "2.out"),
                     return_exceptions=True,
                 )
-                self.assertEqual(submissions, 1)
-                self.assertEqual(tokens, 1)
-                errors = [
-                    outcome for outcome in outcomes if isinstance(outcome, APIError)
-                ]
-                self.assertEqual(len(errors), 1)
-                self.assertEqual(errors[0].status, 429)
-                self.assertEqual(errors[0].retry_after, "5")
-                state.submission_cooldowns["training-2026-03"] = 0
-                await services[1].submit("training-2026.03", 1, "2", b"answer", "2.out")
                 self.assertEqual(submissions, 2)
+                self.assertEqual(tokens, 1)
+                self.assertTrue(all(isinstance(outcome, dict) for outcome in outcomes))
+                await services[1].submit("training-2026.03", 1, "2", b"answer", "2.out")
+                self.assertEqual(submissions, 3)
             finally:
                 for client in clients:
                     await client.close()
@@ -100,7 +94,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                             "test", 1, "1", b"answer", "answer.out"
                         )
                     self.assertEqual(caught.exception.retry_after, "25")
-                self.assertEqual(count, 1)
+                self.assertEqual(count, 2)
             finally:
                 await client.close()
 
@@ -231,7 +225,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                 for client in clients:
                     await client.close()
 
-    async def test_rate_limit_shared_across_contests_then_expires(self):
+    async def test_upstream_token_429_does_not_block_following_requests(self):
         with tempfile.TemporaryDirectory() as root:
             count = 0
 
@@ -256,31 +250,26 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             )
             state = GameSessions()
             try:
-                with patch("ccc_mcp.sessions.time.monotonic", return_value=100):
-                    for slug in ["test", "test", "another-contest"]:
-                        with self.assertRaises(APIError) as caught:
-                            await Service(client, state).session(slug)
-                        self.assertEqual(caught.exception.status, 429)
-                        self.assertEqual(caught.exception.retry_after, "27")
-                    self.assertEqual(count, 1)
-                with patch("ccc_mcp.sessions.time.monotonic", return_value=128):
+                with self.assertRaises(APIError) as caught:
                     await Service(client, state).session("test")
-                self.assertEqual(count, 2)
+                self.assertEqual(caught.exception.status, 429)
+                self.assertEqual(caught.exception.retry_after, "27")
+                await Service(client, state).session("test")
+                await Service(client, state).session("another-contest")
+                self.assertEqual(count, 3)
             finally:
                 await client.close()
 
 
 class CacheTests(unittest.TestCase):
-    def test_idle_cleanup_preserves_upstream_cooldown(self):
+    def test_idle_cleanup_removes_unused_accounts(self):
         cache = AccountSessions(idle_seconds=10)
         with patch("ccc_mcp.sessions.time.monotonic", return_value=100):
             with cache.use("alice") as state:
-                state.blocked_until = 200
+                pass
         with patch("ccc_mcp.sessions.time.monotonic", return_value=150):
-            with cache.use("alice") as same:
-                self.assertIs(same, state)
-                with self.assertRaises(APIError):
-                    same.check_cooldown()
+            with cache.use("alice") as replacement:
+                self.assertIsNot(replacement, state)
 
     def test_bounded_cache_does_not_evict_active_accounts(self):
         cache = AccountSessions(limit=1)
@@ -293,7 +282,7 @@ class CacheTests(unittest.TestCase):
         with cache.use("bob"):
             self.assertNotIn("alice", cache.entries)
 
-    def test_resume_url_and_retry_after_formats(self):
+    def test_resume_url(self):
         self.assertEqual(
             contest_slug("https://codingcontest.org/contests/school-2026/game"),
             "school-2026",
@@ -302,9 +291,3 @@ class CacheTests(unittest.TestCase):
             contest_slug("https://evil.example/contests/test/game")
         with self.assertRaises(ValueError):
             contest_slug("https://codingcontest.org/challenges/birds")
-        self.assertEqual(retry_seconds(APIError(429, {"retryAfterSeconds": 27})), 27)
-        self.assertEqual(retry_seconds(APIError(429, {}, "invalid")), 30)
-        with patch("ccc_mcp.sessions.time.time", return_value=0):
-            self.assertEqual(
-                retry_seconds(APIError(429, {}, "Thu, 01 Jan 1970 00:00:27 GMT")), 27
-            )

@@ -34,10 +34,10 @@ def create_mcp(configured: Settings):
         instructions="list_challenges -> start_training -> prepare_level(contest, level). "
         "For existing games use active_training or a contest slug/URL directly; no start call is needed. "
         "prepare_level returns file artifact IDs and exact inputFiles IDs. For files above 256 KiB, call get_artifact_download_url and save the one-time URL directly into the workspace instead of reading chunks. View statements with render_pdf_page. "
-        "Solve locally; submit_solution accepts text or artifact_id. Check evaluation.isCorrect and cooldownSec. "
+        "Solve locally; submit_solution accepts text or artifact_id. Check evaluation.isCorrect. "
         "Accepted submissions return delivery_job_id; use solution_delivery_status to check Telegram and team fanout. "
         "Accepted solutions are queued for other accounts in X-CCC-Team-Room; when the submitting account is linked to exactly one room, it is selected automatically. Set X-CCC-Team-Room if it is linked to multiple rooms. "
-        "On 429 wait retry_after; never blindly repeat uncertain submissions. "
+        "This MCP adds no request or submission cooldowns. Never blindly repeat uncertain submissions. "
         "Large files: python -m ccc_mcp --url <MCP_URL> download <artifact_id> <path> or upload <path> "
         "with the repository installed and CCC_SESSION set locally.",
         transport_security=TransportSecuritySettings(
@@ -106,7 +106,7 @@ async def _call(fn):
         hint = {
             401: "Update the X-CCC-Session header in your MCP connection.",
             403: "Check participant role, registration, contest state and CSRF.",
-            429: "Respect retry_after/cooldown before retrying.",
+            429: "codingcontest.org returned a rate limit; this MCP imposes no local cooldown.",
             413: "Solution exceeds upstream file limit.",
         }.get(error.status, "Inspect current contest state.")
         return result(

@@ -113,7 +113,7 @@ class OptimizationTests(unittest.IsolatedAsyncioTestCase):
                     await middleware.proxy_transport.aclose()
                 await middleware.telegram_http.aclose()
 
-    async def test_due_queue_respects_time_and_target_spacing(self):
+    async def test_due_queue_ignores_legacy_cooldowns_and_serializes_target(self):
         with tempfile.TemporaryDirectory() as root:
             pools = SessionPools(Path(root) / "pools.sqlite3", "")
             now = time.time()
@@ -147,7 +147,10 @@ class OptimizationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(pools.claim_due())
             pools.finish_job(first["id"], "sent")
             with sqlite3.connect(pools.database) as connection:
-                connection.execute("UPDATE telegram_target_cooldowns SET next_send_at = ? WHERE account_uuid = 'a1'", (now - 1,))
+                connection.execute(
+                    "INSERT INTO telegram_target_cooldowns (room, account_uuid, next_send_at) VALUES (?, ?, ?)",
+                    ("room", "a1", now + 180),
+                )
             resumed = pools.claim_due()
             self.assertEqual(resumed["file_id"], "2")
             pools.finish_job(resumed["id"], "sent")
